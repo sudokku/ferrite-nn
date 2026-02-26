@@ -25,7 +25,7 @@ impl Matrix{
             for j in 0..cols {
                 res.data[i][j] = rng.gen::<f64>() * 2.0 - 1.0;
             }
-            
+
         }
 
         res
@@ -114,11 +114,11 @@ impl Mul for Matrix {
         }
 
         let mut res =  Matrix::zeros(self.rows, rhs.cols);
-        
+
         for i in 0..res.rows {
             for j in 0..res.cols {
                 let mut sum = 0.0;
-                
+
                 for k in 0..self.cols {
                     sum += self.data[i][k] * rhs.data[k][j];
                 }

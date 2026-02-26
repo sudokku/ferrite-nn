@@ -5,7 +5,7 @@ pub enum ActivationFunction {
     Sigmoid,
     ReLU,
     Identity,
-    // TODO: Add more variants
+    // TODO: Add more variants (Tanh, Softmax, LeakyReLU, …)
 }
 
 impl ActivationFunction {

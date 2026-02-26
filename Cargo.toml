@@ -1,9 +1,21 @@
 [package]
-name = "rust-mnist"
+name = "ferrite-nn"
 version = "0.1.0"
 edition = "2021"
+description = "A from-scratch neural network library in Rust — no external ML dependencies."
+license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "ferrite_nn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrite-nn"
+path = "src/main.rs"
+
+[[example]]
+name = "xor"
+path = "examples/xor.rs"
 
 [dependencies]
 rand = "0.8.5"

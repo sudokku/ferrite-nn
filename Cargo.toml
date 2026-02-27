@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "ferrite-nn"
 path = "src/main.rs"
 
+[[bin]]
+name = "studio"
+path = "studio/main.rs"
+
 [[example]]
 name = "xor"
 path = "examples/xor.rs"
@@ -21,14 +25,9 @@ path = "examples/xor.rs"
 name = "mnist"
 path = "examples/mnist.rs"
 
-[[example]]
-name = "gui"
-path = "examples/gui.rs"
-
 [dependencies]
 rand = "0.8.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
 tiny_http = "0.12"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

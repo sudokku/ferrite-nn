@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::f64::consts::E;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ActivationFunction {
     Sigmoid,
     ReLU,

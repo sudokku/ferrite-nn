@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ferrite-nn Studio</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f0f2f5;
+  color: #1a1a2e;
+  min-height: 100vh;
+}
+header {
+  background: #1a1a2e;
+  color: #fff;
+  padding: 14px 28px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+header h1 { font-size: 1.2rem; font-weight: 700; letter-spacing: .5px; }
+header span.sub { font-size: .85rem; color: #8892a4; margin-left: 8px; }
+
+/* Tab bar */
+.tab-bar {
+  background: #fff;
+  border-bottom: 2px solid #e0e4ef;
+  display: flex;
+  padding: 0 28px;
+  gap: 0;
+}
+.tab-btn {
+  padding: 14px 22px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: .92rem;
+  color: #555;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -2px;
+  transition: color .15s, border-color .15s;
+  font-weight: 500;
+}
+.tab-btn:hover:not(.disabled) { color: #2563eb; }
+.tab-btn.active { color: #2563eb; border-bottom-color: #2563eb; }
+.tab-btn.disabled { color: #bbb; cursor: not-allowed; }
+.tab-badge {
+  display: inline-block;
+  background: #e0e4ef;
+  color: #555;
+  border-radius: 10px;
+  font-size: .72rem;
+  padding: 1px 7px;
+  margin-left: 5px;
+  font-weight: 600;
+}
+.tab-btn.active .tab-badge { background: #dbeafe; color: #2563eb; }
+
+/* Main content */
+.content { max-width: 860px; margin: 32px auto; padding: 0 20px 60px; }
+
+/* Cards */
+.card {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  padding: 28px 32px;
+  margin-bottom: 24px;
+}
+.card h2 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #1a1a2e;
+  margin-bottom: 18px;
+  padding-bottom: 10px;
+  border-bottom: 1.5px solid #f0f2f5;
+}
+.card h3 { font-size: .95rem; font-weight: 600; margin-bottom: 12px; color: #333; }
+
+/* Form elements */
+label {
+  display: block;
+  font-size: .85rem;
+  font-weight: 600;
+  color: #444;
+  margin-bottom: 5px;
+  margin-top: 14px;
+}
+label:first-child { margin-top: 0; }
+input[type=text], input[type=number], input[type=file],
+select, textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1.5px solid #d1d5db;
+  border-radius: 8px;
+  font-size: .92rem;
+  color: #1a1a2e;
+  background: #fafafa;
+  transition: border-color .15s;
+}
+input[type=text]:focus, input[type=number]:focus,
+select:focus, textarea:focus {
+  outline: none;
+  border-color: #2563eb;
+  background: #fff;
+}
+textarea { resize: vertical; }
+input[type=radio], input[type=checkbox] { width: auto; margin-right: 6px; }
+
+/* Buttons */
+.btn {
+  display: inline-block;
+  padding: 9px 22px;
+  border: none;
+  border-radius: 8px;
+  font-size: .92rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s, opacity .15s;
+  text-decoration: none;
+}
+.btn-primary { background: #2563eb; color: #fff; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-danger  { background: #dc2626; color: #fff; }
+.btn-danger:hover  { background: #b91c1c; }
+.btn-secondary { background: #e0e4ef; color: #333; }
+.btn-secondary:hover { background: #d1d5db; }
+.btn-sm { padding: 5px 14px; font-size: .82rem; }
+.btn:disabled, .btn.disabled { opacity: .5; cursor: not-allowed; }
+.mt { margin-top: 20px; }
+
+/* Flash messages */
+.flash {
+  padding: 12px 18px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: .9rem;
+  font-weight: 500;
+}
+.flash-success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+.flash-error   { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+
+/* Layer table */
+.layer-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .88rem;
+  margin-top: 8px;
+}
+.layer-table th {
+  background: #f8fafc;
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 1.5px solid #e5e7eb;
+  color: #555;
+}
+.layer-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #f0f2f5;
+  vertical-align: middle;
+}
+.layer-table input, .layer-table select {
+  padding: 5px 8px;
+  font-size: .85rem;
+  width: auto;
+}
+.layer-table .neurons-input { width: 90px; }
+.layer-table .act-select { width: 140px; }
+
+/* Summary table */
+.summary-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .9rem;
+}
+.summary-table th, .summary-table td {
+  padding: 9px 14px;
+  text-align: left;
+  border-bottom: 1px solid #f0f2f5;
+}
+.summary-table th {
+  background: #f8fafc;
+  font-weight: 600;
+  color: #555;
+  width: 40%;
+}
+.summary-table td { color: #1a1a2e; }
+
+/* Metrics row */
+.metrics-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+.metric-card {
+  background: #f8fafc;
+  border: 1.5px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 14px 20px;
+  min-width: 130px;
+  flex: 1;
+  text-align: center;
+}
+.metric-card .val {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #2563eb;
+}
+.metric-card .lbl { font-size: .75rem; color: #666; margin-top: 4px; }
+
+/* Progress bar */
+progress {
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  margin: 12px 0;
+}
+progress::-webkit-progress-bar { background: #e5e7eb; border-radius: 5px; }
+progress::-webkit-progress-value { background: #2563eb; border-radius: 5px; }
+progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
+
+/* Loss chart */
+#loss_chart {
+  display: block;
+  border: 1.5px solid #e5e7eb;
+  border-radius: 8px;
+  margin-top: 12px;
+  background: #fff;
+}
+
+/* Preview table */
+.preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .82rem;
+  margin-top: 8px;
+}
+.preview-table th {
+  background: #f8fafc;
+  padding: 6px 10px;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 1.5px solid #e5e7eb;
+  color: #555;
+}
+.preview-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #f5f5f5;
+  font-family: "SFMono-Regular", Consolas, monospace;
+}
+
+/* Result card */
+.result-card {
+  border: 1.5px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-top: 20px;
+}
+.result-card h2 { font-size: 1rem; border: none; padding: 0; margin-bottom: 12px; }
+.prediction-hero { font-size: 2rem; font-weight: 800; color: #2563eb; }
+.prediction-sub  { font-size: .9rem; color: #666; margin-top: 4px; }
+.prob-table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: .88rem; }
+.prob-table th { padding: 6px 10px; text-align: left; color: #888; font-weight: 600; font-size: .78rem; }
+.prob-table td { padding: 5px 10px; }
+.bar-wrap { background: #f0f2f5; border-radius: 4px; height: 14px; width: 280px; overflow: hidden; }
+.bar-fill  { background: #2563eb; height: 100%; border-radius: 4px; transition: width .3s; }
+.bar-fill.dim { background: #bfdbfe; }
+.prob-pct  { font-family: monospace; color: #555; width: 60px; text-align: right; }
+.raw-output { font-family: "SFMono-Regular", Consolas, monospace; font-size: .9rem; line-height: 1.7; }
+.error-box { color: #dc2626; font-size: .9rem; }
+
+/* Confusion matrix */
+.conf-matrix { border-collapse: collapse; font-size: .82rem; margin-top: 12px; }
+.conf-matrix th, .conf-matrix td {
+  border: 1px solid #e5e7eb;
+  padding: 5px 8px;
+  text-align: center;
+  min-width: 36px;
+}
+.conf-matrix th { background: #f8fafc; font-weight: 600; color: #555; }
+.conf-diag { background: #dcfce7; }
+
+/* SVG loss curve */
+.loss-svg { border: 1.5px solid #e5e7eb; border-radius: 8px; display: block; }
+
+/* Section toggles (Dataset sub-modes) */
+.toggle-group {
+  display: flex;
+  gap: 0;
+  border: 1.5px solid #d1d5db;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 18px;
+  width: fit-content;
+}
+.toggle-btn {
+  padding: 8px 20px;
+  border: none;
+  background: #fff;
+  cursor: pointer;
+  font-size: .88rem;
+  font-weight: 500;
+  color: #555;
+  transition: background .15s;
+}
+.toggle-btn.active { background: #2563eb; color: #fff; }
+
+/* Hint text */
+.hint { font-size: .78rem; color: #888; margin-top: 5px; }
+
+/* Status badges */
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: .78rem;
+  font-weight: 700;
+}
+.badge-idle    { background: #e5e7eb; color: #555; }
+.badge-running { background: #fef3c7; color: #92400e; }
+.badge-done    { background: #dcfce7; color: #166534; }
+.badge-stopped { background: #fee2e2; color: #991b1b; }
+.badge-failed  { background: #fee2e2; color: #991b1b; }
+
+/* Train log live area */
+.live-stats {
+  display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0;
+}
+.live-stat { text-align: center; min-width: 110px; }
+.live-stat .ls-val { font-size: 1.4rem; font-weight: 800; color: #1a1a2e; }
+.live-stat .ls-lbl { font-size: .72rem; color: #888; }
+
+/* Warning banner */
+.warning-box {
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: .87rem;
+  color: #92400e;
+  margin-top: 10px;
+}
+
+/* Model file selector */
+.model-select { max-width: 360px; }
+
+/* two-col layout */
+.two-col { display: flex; gap: 20px; }
+.two-col > * { flex: 1; }
+@media (max-width: 600px) { .two-col { flex-direction: column; } }
+
+/* Grid for arch summary */
+.arch-summary-grid { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; }
+.arch-row { display: flex; gap: 10px; }
+.arch-row .ar-lbl { color: #888; min-width: 120px; font-size: .82rem; }
+.arch-row .ar-val { color: #1a1a2e; font-weight: 500; }
+
+/* Hidden utility */
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+    <rect width="26" height="26" rx="6" fill="#2563eb"/>
+    <circle cx="5" cy="13" r="2.5" fill="#fff"/>
+    <circle cx="13" cy="6"  r="2.5" fill="#fff"/>
+    <circle cx="13" cy="20" r="2.5" fill="#fff"/>
+    <circle cx="21" cy="13" r="2.5" fill="#fff"/>
+    <line x1="7.2" y1="11.8" x2="11.2" y2="7.2" stroke="#fff" stroke-width="1.4"/>
+    <line x1="7.2" y1="14.2" x2="11.2" y2="18.8" stroke="#fff" stroke-width="1.4"/>
+    <line x1="14.8" y1="7.2" x2="18.8" y2="11.8" stroke="#fff" stroke-width="1.4"/>
+    <line x1="14.8" y1="18.8" x2="18.8" y2="14.2" stroke="#fff" stroke-width="1.4"/>
+  </svg>
+  <h1>ferrite-nn Studio</h1>
+  <span class="sub">Neural Network Creation &amp; Training Platform</span>
+</header>
+
+<div class="tab-bar" id="tab-bar">
+  <button class="tab-btn" id="tb-0" onclick="switchTab(0)">Architect <span class="tab-badge">1</span></button>
+  <button class="tab-btn" id="tb-1" onclick="switchTab(1)">Dataset   <span class="tab-badge">2</span></button>
+  <button class="tab-btn" id="tb-2" onclick="switchTab(2)">Train     <span class="tab-badge">3</span></button>
+  <button class="tab-btn" id="tb-3" onclick="switchTab(3)">Evaluate  <span class="tab-badge">4</span></button>
+  <button class="tab-btn" id="tb-4" onclick="switchTab(4)">Test      <span class="tab-badge">5</span></button>
+</div>
+
+<div class="content">
+
+<!-- ======================================================================
+     TAB 0 — ARCHITECT
+     ====================================================================== -->
+<div class="tab-panel" id="tp-0">
+
+{{FLASH_ARCH}}
+
+<div class="card">
+<h2>Network Architecture</h2>
+<form method="POST" action="/architect/save">
+
+<label for="net-name">Model name</label>
+<input type="text" id="net-name" name="name" value="{{ARCH_NAME}}" placeholder="my_network" required>
+
+<label for="net-desc">Description <span style="font-weight:400;color:#999">(optional)</span></label>
+<textarea id="net-desc" name="description" rows="2" placeholder="What does this network do?">{{ARCH_DESC}}</textarea>
+
+<label for="input-size">Input size (number of features)</label>
+<input type="number" id="input-size" name="input_size" value="{{ARCH_INPUT_SIZE}}" min="1" required style="max-width:160px">
+
+<div style="margin-top:20px">
+  <h3>Hidden &amp; Output Layers</h3>
+  <p class="hint" style="margin-bottom:10px">Add layers from input to output. The last layer should match your task (e.g. Softmax for classification).</p>
+  <table class="layer-table" id="layer-tbl">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Neurons</th>
+        <th>Activation</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="layer-body">
+{{LAYER_ROWS}}
+    </tbody>
+  </table>
+  <button type="button" class="btn btn-secondary btn-sm mt" onclick="addLayer()">+ Add layer</button>
+</div>
+
+<!-- Hidden field encoding layer data as JSON -->
+<input type="hidden" id="layers-json" name="layers_json" value="">
+
+<div class="two-col" style="margin-top:22px">
+<div>
+<label for="loss-type">Loss function</label>
+<select id="loss-type" name="loss_type">
+  <option value="mse"{{SEL_MSE}}>Mean Squared Error (MSE)</option>
+  <option value="cross_entropy"{{SEL_CE}}>Cross-Entropy (Softmax)</option>
+</select>
+</div>
+</div>
+
+<div style="border-top:1.5px solid #f0f2f5; margin-top:22px; padding-top:18px">
+  <h3>Training Hyperparameters</h3>
+  <div class="two-col">
+    <div>
+      <label for="lr">Learning rate</label>
+      <input type="text" id="lr" name="learning_rate" value="{{ARCH_LR}}" placeholder="0.01">
+    </div>
+    <div>
+      <label for="bs">Batch size</label>
+      <input type="number" id="bs" name="batch_size" value="{{ARCH_BS}}" min="1" placeholder="32">
+    </div>
+  </div>
+  <div class="two-col">
+    <div>
+      <label for="ep">Epochs</label>
+      <input type="number" id="ep" name="epochs" value="{{ARCH_EP}}" min="1" placeholder="50">
+    </div>
+    <div></div>
+  </div>
+</div>
+
+<div id="arch-warning" class="warning-box hidden">
+  Last layer uses Softmax but Loss is MSE — consider using Cross-Entropy instead.
+</div>
+{{ARCH_ERROR}}
+
+<div class="mt">
+  <button type="submit" class="btn btn-primary" onclick="return prepareSubmit()">Save Architecture</button>
+</div>
+
+</form>
+</div><!-- card -->
+</div><!-- tp-0 -->
+
+<!-- ======================================================================
+     TAB 1 — DATASET
+     ====================================================================== -->
+<div class="tab-panel" id="tp-1">
+
+{{FLASH_DATASET}}
+
+<div class="card">
+<h2>Load Dataset</h2>
+
+<div class="toggle-group">
+  <button type="button" class="toggle-btn {{DS_UPLOAD_ACTIVE}}" id="ds-toggle-upload" onclick="toggleDataset('upload')">Upload CSV</button>
+  <button type="button" class="toggle-btn {{DS_BUILTIN_ACTIVE}}" id="ds-toggle-builtin" onclick="toggleDataset('builtin')">Built-in</button>
+</div>
+
+<!-- CSV Upload sub-panel -->
+<div id="ds-upload-panel" class="{{DS_UPLOAD_HIDE}}">
+<form method="POST" action="/dataset/upload" enctype="multipart/form-data">
+  <label for="csv-file">CSV file</label>
+  <input type="file" id="csv-file" name="csv_file" accept=".csv,text/csv" required>
+  <p class="hint">UTF-8, comma-separated. Max 50 MB.</p>
+
+  <div class="two-col">
+    <div>
+      <label for="val-split">Validation split %</label>
+      <input type="number" id="val-split" name="val_split" value="{{DS_VAL_SPLIT}}" min="0" max="50" style="max-width:100px">
+    </div>
+    <div>
+      <label for="label-mode">Label mode</label>
+      <select id="label-mode" name="label_mode">
+        <option value="class_index"{{SEL_CI}}>ClassIndex (last col = integer)</option>
+        <option value="one_hot"{{SEL_OH}}>OneHot (last N cols = floats)</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="n-classes-row" class="{{N_CLASSES_HIDE}}" style="margin-top:12px">
+    <label for="n-classes">Number of classes (for ClassIndex)</label>
+    <input type="number" id="n-classes" name="n_classes" value="{{DS_N_CLASSES}}" min="2" style="max-width:120px">
+  </div>
+  <div id="n-label-cols-row" class="{{N_LABEL_COLS_HIDE}}" style="margin-top:12px">
+    <label for="n-label-cols">Number of label columns (for OneHot)</label>
+    <input type="number" id="n-label-cols" name="n_label_cols" value="{{DS_N_LABEL_COLS}}" min="1" style="max-width:120px">
+  </div>
+
+  {{DS_ERROR}}
+  <div class="mt">
+    <button type="submit" class="btn btn-primary">Load CSV</button>
+  </div>
+</form>
+</div><!-- ds-upload-panel -->
+
+<!-- Built-in sub-panel -->
+<div id="ds-builtin-panel" class="{{DS_BUILTIN_HIDE}}">
+<form method="POST" action="/dataset/builtin">
+  <label>Dataset</label>
+  <div style="display:flex; flex-direction:column; gap:8px; margin-top:4px">
+    <label style="font-weight:400"><input type="radio" name="builtin_name" value="xor" {{SEL_XOR}}> XOR (4 samples, 2 features, 2 classes)</label>
+    <label style="font-weight:400"><input type="radio" name="builtin_name" value="circles" {{SEL_CIRCLES}}> Circles (200 samples, 2 features, 2 classes)</label>
+    <label style="font-weight:400"><input type="radio" name="builtin_name" value="blobs" {{SEL_BLOBS}}> Blobs (200 samples, 2 features, 2 classes)</label>
+    {{MNIST_OPTION}}
+  </div>
+
+  <div class="two-col" style="margin-top:16px">
+    <div>
+      <label for="builtin-val-split">Validation split %</label>
+      <input type="number" name="val_split" value="{{DS_VAL_SPLIT}}" min="0" max="50" style="max-width:100px">
+    </div>
+    <div></div>
+  </div>
+
+  {{DS_ERROR}}
+  <div class="mt">
+    <button type="submit" class="btn btn-primary">Load Dataset</button>
+  </div>
+</form>
+</div><!-- ds-builtin-panel -->
+
+</div><!-- card -->
+
+{{DS_SUMMARY}}
+
+</div><!-- tp-1 -->
+
+<!-- ======================================================================
+     TAB 2 — TRAIN
+     ====================================================================== -->
+<div class="tab-panel" id="tp-2">
+
+{{FLASH_TRAIN}}
+
+<!-- Pre-training summary (shown when Idle) -->
+<div id="train-summary-card" class="card {{TRAIN_SUMMARY_HIDE}}">
+<h2>Ready to Train</h2>
+{{TRAIN_ARCH_SUMMARY}}
+{{TRAIN_DATA_SUMMARY}}
+<div class="mt">
+  <form method="POST" action="/train/start">
+    {{TRAIN_ERROR}}
+    <button type="submit" class="btn btn-primary">Start Training</button>
+  </form>
+</div>
+</div><!-- pre-training card -->
+
+<!-- Live training card (shown when Running) -->
+<div id="train-live-card" class="card {{TRAIN_LIVE_HIDE}}">
+<h2>Training in Progress <span class="badge badge-running" id="status-badge">Running</span></h2>
+
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px">
+  <span id="epoch-counter" style="font-size:.9rem; color:#555">Epoch — / {{TRAIN_TOTAL_EPOCHS}}</span>
+  <span id="elapsed-span" style="font-size:.82rem; color:#999"></span>
+</div>
+<progress id="epoch-progress" value="0" max="{{TRAIN_TOTAL_EPOCHS}}"></progress>
+
+<div class="live-stats">
+  <div class="live-stat">
+    <div class="ls-val" id="ls-train-loss">—</div>
+    <div class="ls-lbl">Train loss</div>
+  </div>
+  <div class="live-stat" id="ls-val-loss-wrap">
+    <div class="ls-val" id="ls-val-loss">—</div>
+    <div class="ls-lbl">Val loss</div>
+  </div>
+  <div class="live-stat" id="ls-train-acc-wrap">
+    <div class="ls-val" id="ls-train-acc">—</div>
+    <div class="ls-lbl">Train acc</div>
+  </div>
+  <div class="live-stat" id="ls-val-acc-wrap">
+    <div class="ls-val" id="ls-val-acc">—</div>
+    <div class="ls-lbl">Val acc</div>
+  </div>
+</div>
+
+<canvas id="loss_chart" width="760" height="200"></canvas>
+
+<div class="mt" style="display:flex; gap:12px; align-items:center">
+  <form method="POST" action="/train/stop" style="display:inline">
+    <button type="submit" class="btn btn-danger">Stop Training</button>
+  </form>
+  <span id="stop-note" class="hint">Stop will complete the current epoch first.</span>
+</div>
+</div><!-- live card -->
+
+<!-- Post-training card (shown when Done or Stopped) -->
+<div id="train-done-card" class="card {{TRAIN_DONE_HIDE}}">
+<h2>Training Complete <span class="badge badge-done" id="done-badge">{{TRAIN_STATUS_BADGE}}</span></h2>
+{{TRAIN_DONE_STATS}}
+<div class="mt" style="display:flex; gap:12px; flex-wrap:wrap">
+  <a href="/evaluate" class="btn btn-primary">Go to Evaluate</a>
+  {{TRAIN_DOWNLOAD_LINK}}
+</div>
+</div><!-- done card -->
+
+<!-- Failed card -->
+<div id="train-failed-card" class="card {{TRAIN_FAILED_HIDE}}">
+<h2>Training Failed</h2>
+<div class="error-box">{{TRAIN_FAIL_REASON}}</div>
+<div class="mt">
+  <form method="POST" action="/train/start">
+    <button type="submit" class="btn btn-primary">Retry</button>
+  </form>
+</div>
+</div><!-- failed card -->
+
+</div><!-- tp-2 -->
+
+<!-- ======================================================================
+     TAB 3 — EVALUATE
+     ====================================================================== -->
+<div class="tab-panel" id="tp-3">
+
+<div class="card">
+<h2>Loss Curve</h2>
+{{EVAL_LOSS_SVG}}
+</div>
+
+<div class="card">
+<h2>Final Metrics</h2>
+{{EVAL_METRICS_TABLE}}
+</div>
+
+{{EVAL_CONFUSION}}
+
+<div class="card">
+<h2>Export</h2>
+<p style="font-size:.9rem; color:#555; margin-bottom:14px">Download the full epoch-by-epoch history as JSON for offline analysis.</p>
+<a href="/evaluate/export" class="btn btn-secondary">Download epoch_history.json</a>
+</div>
+
+</div><!-- tp-3 -->
+
+<!-- ======================================================================
+     TAB 4 — TEST
+     ====================================================================== -->
+<div class="tab-panel" id="tp-4">
+
+<div class="card">
+<h2>Run Inference</h2>
+
+<label for="model-select">Select model</label>
+<select id="model-select" name="model" class="model-select"
+        onchange="window.location='/test?model='+this.value">
+  {{MODEL_OPTIONS}}
+</select>
+
+{{TEST_INPUT_SECTION}}
+
+{{TEST_RESULT_SECTION}}
+
+</div><!-- card -->
+</div><!-- tp-4 -->
+
+</div><!-- content -->
+
+<script>
+// ---------------------------------------------------------------------------
+// Tab unlock + switching
+// ---------------------------------------------------------------------------
+var TAB_UNLOCK = {{TAB_UNLOCK}};
+var ACTIVE_TAB = {{ACTIVE_TAB}};
+
+function switchTab(n) {
+  if (!((TAB_UNLOCK >> n) & 1)) return;
+  for (var i = 0; i < 5; i++) {
+    document.getElementById('tb-' + i).classList.remove('active');
+    document.getElementById('tp-' + i).style.display = 'none';
+  }
+  document.getElementById('tb-' + n).classList.add('active');
+  document.getElementById('tp-' + n).style.display = 'block';
+
+  // Start SSE if switching to Train and training is running.
+  if (n === 2) maybeStartSSE();
+}
+
+function initTabs() {
+  for (var i = 0; i < 5; i++) {
+    var btn = document.getElementById('tb-' + i);
+    if (!((TAB_UNLOCK >> i) & 1)) {
+      btn.classList.add('disabled');
+    }
+  }
+  switchTab(ACTIVE_TAB);
+}
+initTabs();
+
+// ---------------------------------------------------------------------------
+// Architect: dynamic layer table
+// ---------------------------------------------------------------------------
+var layerCount = 0;
+
+function addLayer(neurons, activation) {
+  layerCount++;
+  var n = neurons || 32;
+  var a = activation || 'relu';
+  var acts = ['sigmoid','relu','identity','softmax'];
+  var actOpts = acts.map(function(v) {
+    var sel = (v === a) ? ' selected' : '';
+    return '<option value="' + v + '"' + sel + '>' + v.charAt(0).toUpperCase() + v.slice(1) + '</option>';
+  }).join('');
+
+  var tbody = document.getElementById('layer-body');
+  var tr = document.createElement('tr');
+  tr.id = 'lr-' + layerCount;
+  tr.innerHTML =
+    '<td>' + layerCount + '</td>' +
+    '<td><input type="number" class="neurons-input" data-field="neurons" value="' + n + '" min="1"></td>' +
+    '<td><select class="act-select" data-field="activation">' + actOpts + '</select></td>' +
+    '<td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(' + layerCount + ')">Remove</button></td>';
+  tbody.appendChild(tr);
+  updateWarning();
+}
+
+function removeLayer(id) {
+  var row = document.getElementById('lr-' + id);
+  if (row) row.remove();
+  renumberLayers();
+  updateWarning();
+}
+
+function renumberLayers() {
+  var rows = document.querySelectorAll('#layer-body tr');
+  rows.forEach(function(row, i) {
+    row.cells[0].textContent = i + 1;
+  });
+}
+
+function gatherLayers() {
+  var rows = document.querySelectorAll('#layer-body tr');
+  return Array.from(rows).map(function(row) {
+    return {
+      neurons:    parseInt(row.querySelector('[data-field=neurons]').value, 10) || 1,
+      activation: row.querySelector('[data-field=activation]').value
+    };
+  });
+}
+
+function prepareSubmit() {
+  var layers = gatherLayers();
+  if (layers.length === 0) {
+    alert('Add at least one layer.');
+    return false;
+  }
+  document.getElementById('layers-json').value = JSON.stringify(layers);
+  return true;
+}
+
+function updateWarning() {
+  var layers = gatherLayers();
+  var lastAct = layers.length > 0 ? layers[layers.length - 1].activation : '';
+  var lossType = document.getElementById('loss-type').value;
+  var warn = document.getElementById('arch-warning');
+  if (warn) {
+    var show = (lastAct === 'softmax' && lossType === 'mse') ||
+               (lastAct !== 'softmax' && lossType === 'cross_entropy' && layers.length > 0);
+    warn.classList.toggle('hidden', !show);
+  }
+}
+
+document.getElementById('loss-type').addEventListener('change', updateWarning);
+
+// ---------------------------------------------------------------------------
+// Dataset: toggle upload / builtin panels
+// ---------------------------------------------------------------------------
+function toggleDataset(mode) {
+  var uploadPanel  = document.getElementById('ds-upload-panel');
+  var builtinPanel = document.getElementById('ds-builtin-panel');
+  var btnUpload    = document.getElementById('ds-toggle-upload');
+  var btnBuiltin   = document.getElementById('ds-toggle-builtin');
+  if (mode === 'upload') {
+    uploadPanel.style.display  = 'block';
+    builtinPanel.style.display = 'none';
+    btnUpload.classList.add('active');
+    btnBuiltin.classList.remove('active');
+  } else {
+    uploadPanel.style.display  = 'none';
+    builtinPanel.style.display = 'block';
+    btnUpload.classList.remove('active');
+    btnBuiltin.classList.add('active');
+  }
+}
+
+// Label mode toggles n_classes / n_label_cols visibility.
+var lmSel = document.getElementById('label-mode');
+if (lmSel) {
+  function updateLabelModeUI() {
+    var v = lmSel.value;
+    document.getElementById('n-classes-row').style.display    = (v === 'class_index') ? '' : 'none';
+    document.getElementById('n-label-cols-row').style.display = (v === 'one_hot')     ? '' : 'none';
+  }
+  lmSel.addEventListener('change', updateLabelModeUI);
+  updateLabelModeUI();
+}
+
+// ---------------------------------------------------------------------------
+// SSE-driven live training chart
+// ---------------------------------------------------------------------------
+var trainLossPts = [];
+var valLossPts   = [];
+var sseSource    = null;
+var TRAINING_RUNNING = {{TRAINING_RUNNING}};
+
+function maybeStartSSE() {
+  if (!TRAINING_RUNNING) return;
+  if (sseSource && sseSource.readyState !== EventSource.CLOSED) return;
+
+  sseSource = new EventSource('/train/events');
+
+  sseSource.addEventListener('epoch', function(e) {
+    var d = JSON.parse(e.data);
+    trainLossPts.push(d.train_loss);
+    if (d.val_loss !== null && d.val_loss !== undefined) valLossPts.push(d.val_loss);
+
+    document.getElementById('epoch-counter').textContent =
+      'Epoch ' + d.epoch + ' / ' + d.total_epochs;
+    document.getElementById('epoch-progress').value = d.epoch;
+    document.getElementById('epoch-progress').max   = d.total_epochs;
+    document.getElementById('ls-train-loss').textContent = d.train_loss.toFixed(5);
+    if (d.val_loss !== null && d.val_loss !== undefined)
+      document.getElementById('ls-val-loss').textContent = d.val_loss.toFixed(5);
+    if (d.train_accuracy !== null && d.train_accuracy !== undefined)
+      document.getElementById('ls-train-acc').textContent = (d.train_accuracy * 100).toFixed(1) + '%';
+    if (d.val_accuracy !== null && d.val_accuracy !== undefined)
+      document.getElementById('ls-val-acc').textContent = (d.val_accuracy * 100).toFixed(1) + '%';
+    document.getElementById('elapsed-span').textContent = d.elapsed_ms + ' ms/epoch';
+
+    redrawChart();
+  });
+
+  sseSource.addEventListener('done', function(e) {
+    var d = JSON.parse(e.data);
+    TRAINING_RUNNING = false;
+    sseSource.close();
+    // Reload page to show Done state.
+    window.location.reload();
+  });
+
+  sseSource.addEventListener('stopped', function(e) {
+    TRAINING_RUNNING = false;
+    sseSource.close();
+    window.location.reload();
+  });
+}
+
+function redrawChart() {
+  var canvas = document.getElementById('loss_chart');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  var PAD = { top: 16, right: 16, bottom: 30, left: 56 };
+  ctx.clearRect(0, 0, W, H);
+
+  var allPts = trainLossPts.concat(valLossPts);
+  if (allPts.length === 0) return;
+
+  var maxY = Math.max.apply(null, allPts) * 1.05;
+  var minY = 0;
+  var n    = trainLossPts.length;
+  if (n < 2) return;
+
+  var xScale = (W - PAD.left - PAD.right)  / (n - 1);
+  var yScale = (H - PAD.top  - PAD.bottom) / (maxY - minY || 1);
+
+  function px(i, v) {
+    return {
+      x: PAD.left + i * xScale,
+      y: PAD.top  + (maxY - v) * yScale
+    };
+  }
+
+  // Grid lines
+  ctx.strokeStyle = '#f0f2f5';
+  ctx.lineWidth = 1;
+  for (var g = 0; g <= 4; g++) {
+    var yv = minY + (maxY - minY) * g / 4;
+    var yp = PAD.top + (maxY - yv) * yScale;
+    ctx.beginPath(); ctx.moveTo(PAD.left, yp); ctx.lineTo(W - PAD.right, yp); ctx.stroke();
+    ctx.fillStyle = '#999'; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(yv.toFixed(3), PAD.left - 4, yp + 4);
+  }
+
+  // X axis labels
+  ctx.fillStyle = '#999'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  [0, Math.floor(n/2), n-1].forEach(function(i) {
+    var p = px(i, 0);
+    ctx.fillText(i + 1, p.x, H - 6);
+  });
+
+  // Train loss line (solid red)
+  ctx.strokeStyle = '#dc2626';
+  ctx.lineWidth = 2;
+  ctx.lineJoin  = 'round';
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  trainLossPts.forEach(function(v, i) {
+    var p = px(i, v);
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  });
+  ctx.stroke();
+
+  // Val loss line (dashed blue)
+  if (valLossPts.length >= 2) {
+    ctx.strokeStyle = '#1e40af';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    valLossPts.forEach(function(v, i) {
+      var p = px(i, v);
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Legend
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#dc2626'; ctx.fillRect(PAD.left, 4, 18, 4);
+  ctx.fillStyle = '#333'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('train', PAD.left + 22, 9);
+  if (valLossPts.length >= 2) {
+    ctx.strokeStyle = '#1e40af'; ctx.lineWidth = 1.5; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(PAD.left + 72, 6); ctx.lineTo(PAD.left + 90, 6); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#333'; ctx.fillText('val', PAD.left + 94, 9);
+  }
+}
+
+// Auto-start SSE if training is already in progress when the page loads.
+if (TRAINING_RUNNING) {
+  switchTab(2);
+  maybeStartSSE();
+}
+</script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 use crate::{math::matrix::Matrix, activation::activation::ActivationFunction};
 use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Layer{
     pub size: usize,
     #[serde(skip)]

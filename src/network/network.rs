@@ -1,9 +1,13 @@
 use crate::{activation::activation::ActivationFunction, layers::dense::Layer};
+use crate::network::metadata::ModelMetadata;
+use crate::network::spec::NetworkSpec;
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Network {
     pub layers: Vec<Layer>,
+    #[serde(default)]
+    pub metadata: Option<ModelMetadata>,
 }
 
 impl Network {
@@ -12,7 +16,7 @@ impl Network {
         let layers = layer_specs.into_iter()
             .map(|(size, input_size, activation)| Layer::new(size, input_size, activation))
             .collect();
-        Network { layers }
+        Network { layers, metadata: None }
     }
 
     /// Forward pass; stores activations in each layer for backprop.
@@ -38,5 +42,22 @@ impl Network {
         let reader = std::io::BufReader::new(file);
         serde_json::from_reader(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    /// Builds a fresh (randomly initialized) `Network` from a `NetworkSpec`.
+    ///
+    /// Weight initialization follows `Layer::new` conventions:
+    /// - ReLU activations → He init
+    /// - everything else  → Xavier init
+    ///
+    /// Metadata is copied from the spec if present.
+    pub fn from_spec(spec: &NetworkSpec) -> Network {
+        let layers = spec.layers.iter()
+            .map(|ls| Layer::new(ls.size, ls.input_size, ls.activation.clone()))
+            .collect();
+        Network {
+            layers,
+            metadata: spec.metadata.clone(),
+        }
     }
 }

@@ -19,6 +19,8 @@ use ferrite_nn::{
     ActivationFunction,
     CrossEntropyLoss,
     Sgd,
+    ModelMetadata,
+    InputType,
     math::matrix::Matrix,
 };
 use rand::seq::SliceRandom;
@@ -342,9 +344,15 @@ fn main() {
         println!("]  CE Loss: {:>10.6}  Train Acc: {:>6.2}%", loss, train_acc);
     }
 
-    // --- Save model weights ---
-    let model_dir = "examples/trained_models";
-    let model_path = "examples/trained_models/mnist.json";
+    // --- Attach metadata and save model weights ---
+    network.metadata = Some(ModelMetadata {
+        description: Some("MNIST handwritten digit classifier — 784→256→128→10".into()),
+        input_type: Some(InputType::ImageGrayscale { width: 28, height: 28 }),
+        output_labels: Some((0..10).map(|i| i.to_string()).collect()),
+    });
+
+    let model_dir = "trained_models";
+    let model_path = "trained_models/mnist.json";
     std::fs::create_dir_all(model_dir).expect("Failed to create model directory");
     network.save_json(model_path).expect("Failed to save model");
     println!("\nModel saved to {}", model_path);

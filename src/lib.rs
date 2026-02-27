@@ -12,5 +12,6 @@ pub use activation::activation::ActivationFunction;
 pub use layers::dense::Layer;
 pub use network::network::Network;
 pub use loss::mse::MseLoss;
+pub use loss::cross_entropy::CrossEntropyLoss;
 pub use optim::sgd::Sgd;
 pub use train::trainer::train_network;

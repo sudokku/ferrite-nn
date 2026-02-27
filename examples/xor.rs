@@ -23,7 +23,7 @@ fn main() {
     let epochs = 10000;
 
     for epoch in 0..epochs {
-        let loss = train_network(&mut network, &inputs, &expected_outputs, &optimizer);
+        let loss = train_network(&mut network, &inputs, &expected_outputs, &optimizer, 1);
         if epoch % 1000 == 0 {
             println!("Epoch {epoch}: loss = {loss:.6}");
         }

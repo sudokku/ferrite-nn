@@ -1,7 +1,9 @@
 use rand::prelude::*;
+use serde::{Serialize, Deserialize};
+use std::f64::consts::PI;
 use std::ops::{Add, Sub, Mul};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Matrix{
     pub rows: usize,
     pub cols: usize,
@@ -28,6 +30,51 @@ impl Matrix{
 
         }
 
+        res
+    }
+
+    /// Samples a single value from N(0, 1) using the Box-Muller transform.
+    /// Both u1 and u2 must be uniform on (0, 1].
+    fn sample_standard_normal(rng: &mut ThreadRng) -> f64 {
+        // Draw two independent uniform samples in (0, 1] to avoid log(0).
+        let u1: f64 = 1.0 - rng.gen::<f64>();
+        let u2: f64 = 1.0 - rng.gen::<f64>();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    }
+
+    /// He initialization: samples from N(0, sqrt(2 / cols)).
+    ///
+    /// Recommended before ReLU layers. The variance 2/fan_in accounts for
+    /// the fact that ReLU zeroes half of its inputs on average.
+    ///
+    /// Shape: (rows, cols). `cols` is the fan-in (number of input connections).
+    pub fn he(rows: usize, cols: usize) -> Matrix {
+        let mut rng = rand::thread_rng();
+        let std_dev = (2.0 / cols as f64).sqrt();
+        let mut res = Matrix::zeros(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                res.data[i][j] = Matrix::sample_standard_normal(&mut rng) * std_dev;
+            }
+        }
+        res
+    }
+
+    /// Xavier (Glorot) initialization: samples from N(0, sqrt(1 / cols)).
+    ///
+    /// Recommended before Sigmoid/Tanh/Identity layers. Keeps the variance of
+    /// activations and gradients roughly equal across layers.
+    ///
+    /// Shape: (rows, cols). `cols` is the fan-in (number of input connections).
+    pub fn xavier(rows: usize, cols: usize) -> Matrix {
+        let mut rng = rand::thread_rng();
+        let std_dev = (1.0 / cols as f64).sqrt();
+        let mut res = Matrix::zeros(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                res.data[i][j] = Matrix::sample_standard_normal(&mut rng) * std_dev;
+            }
+        }
         res
     }
 
@@ -62,6 +109,12 @@ impl Matrix{
             cols: data[0].len(),
             data
         }
+    }
+}
+
+impl Default for Matrix {
+    fn default() -> Self {
+        Matrix { rows: 0, cols: 0, data: vec![] }
     }
 }
 

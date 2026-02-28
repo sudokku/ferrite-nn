@@ -107,9 +107,10 @@ pub fn dispatch(mut request: Request, state: SharedState) {
         (Method::Post, "/architect/save")  => handlers::architect::handle_post(&mut request, state),
 
         // ── Dataset ──────────────────────────────────────────────────────
-        (Method::Get,  "/dataset")          => handlers::dataset::handle_get(state),
-        (Method::Post, "/dataset/upload")   => handlers::dataset::handle_upload(&mut request, state),
-        (Method::Post, "/dataset/builtin")  => handlers::dataset::handle_builtin(&mut request, state),
+        (Method::Get,  "/dataset")              => handlers::dataset::handle_get(state),
+        (Method::Post, "/dataset/upload")       => handlers::dataset::handle_upload(&mut request, state),
+        (Method::Post, "/dataset/upload-idx")   => handlers::dataset::handle_upload_idx(&mut request, state),
+        (Method::Post, "/dataset/builtin")      => handlers::dataset::handle_builtin(&mut request, state),
 
         // ── Train ────────────────────────────────────────────────────────
         (Method::Get,  "/train")        => handlers::train::handle_get(state),

@@ -493,6 +493,7 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
 
 <div class="toggle-group">
   <button type="button" class="toggle-btn {{DS_UPLOAD_ACTIVE}}" id="ds-toggle-upload" onclick="toggleDataset('upload')">Upload CSV</button>
+  <button type="button" class="toggle-btn {{DS_IDX_ACTIVE}}" id="ds-toggle-idx" onclick="toggleDataset('idx')">IDX / MNIST</button>
   <button type="button" class="toggle-btn {{DS_BUILTIN_ACTIVE}}" id="ds-toggle-builtin" onclick="toggleDataset('builtin')">Built-in</button>
 </div>
 
@@ -532,6 +533,35 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
   </div>
 </form>
 </div><!-- ds-upload-panel -->
+
+<!-- IDX / MNIST sub-panel -->
+<div id="ds-idx-panel" class="{{DS_IDX_HIDE}}">
+<form method="POST" action="/dataset/upload-idx" enctype="multipart/form-data">
+  <label for="idx-images-file">Images file (IDX3, e.g. train-images-idx3-ubyte)</label>
+  <input type="file" id="idx-images-file" name="images_file" required>
+
+  <label for="idx-labels-file" style="margin-top:12px;display:block">Labels file (IDX1, e.g. train-labels-idx1-ubyte)</label>
+  <input type="file" id="idx-labels-file" name="labels_file" required>
+
+  <p class="hint" style="margin-top:8px">Accepts raw IDX binary files from MNIST, Fashion-MNIST, EMNIST, and derivatives. No conversion needed.</p>
+
+  <div class="two-col" style="margin-top:16px">
+    <div>
+      <label for="idx-n-classes">Number of classes</label>
+      <input type="number" id="idx-n-classes" name="n_classes" value="10" min="2" style="max-width:120px">
+    </div>
+    <div>
+      <label for="idx-val-split">Validation split %</label>
+      <input type="number" id="idx-val-split" name="val_split" value="10" min="0" max="50" style="max-width:100px">
+    </div>
+  </div>
+
+  {{DS_ERROR}}
+  <div class="mt">
+    <button type="submit" class="btn btn-primary">Load IDX Dataset</button>
+  </div>
+</form>
+</div><!-- ds-idx-panel -->
 
 <!-- Built-in sub-panel -->
 <div id="ds-builtin-panel" class="{{DS_BUILTIN_HIDE}}">
@@ -751,6 +781,9 @@ function restoreTrainDone() {
   if (!raw) return;
   var d;
   try { d = JSON.parse(raw); } catch (ex) { return; }
+  // Only restore if there is a real model path — an entry without model_path
+  // is stale data from a failed run and must not shadow the Failed card.
+  if (!d.model_path) return;
 
   var doneCard    = document.getElementById('train-done-card');
   var liveCard    = document.getElementById('train-live-card');
@@ -896,20 +929,19 @@ function updateWarning() {
 // ---------------------------------------------------------------------------
 function toggleDataset(mode) {
   var uploadPanel  = document.getElementById('ds-upload-panel');
+  var idxPanel     = document.getElementById('ds-idx-panel');
   var builtinPanel = document.getElementById('ds-builtin-panel');
   var btnUpload    = document.getElementById('ds-toggle-upload');
+  var btnIdx       = document.getElementById('ds-toggle-idx');
   var btnBuiltin   = document.getElementById('ds-toggle-builtin');
-  if (mode === 'upload') {
-    uploadPanel.style.display  = 'block';
-    builtinPanel.style.display = 'none';
-    btnUpload.classList.add('active');
-    btnBuiltin.classList.remove('active');
-  } else {
-    uploadPanel.style.display  = 'none';
-    builtinPanel.style.display = 'block';
-    btnUpload.classList.remove('active');
-    btnBuiltin.classList.add('active');
-  }
+
+  uploadPanel.style.display  = (mode === 'upload')  ? 'block' : 'none';
+  idxPanel.style.display     = (mode === 'idx')     ? 'block' : 'none';
+  builtinPanel.style.display = (mode === 'builtin') ? 'block' : 'none';
+
+  btnUpload.classList.toggle('active',  mode === 'upload');
+  btnIdx.classList.toggle('active',     mode === 'idx');
+  btnBuiltin.classList.toggle('active', mode === 'builtin');
 }
 
 // Label mode toggles n_classes / n_label_cols visibility.
@@ -963,9 +995,15 @@ function maybeStartSSE() {
     var d = JSON.parse(e.data);
     TRAINING_RUNNING = false;
     sseSource.close();
-    // Persist completion data so it survives client-side tab navigation.
-    d._badge = 'Done';
-    sessionStorage.setItem('trainDone', JSON.stringify(d));
+    if (d.model_path) {
+      // Real completion — persist so tab-switching restores the Done card.
+      d._badge = 'Done';
+      sessionStorage.setItem('trainDone', JSON.stringify(d));
+    } else {
+      // No model path means something went wrong server-side.
+      // Clear any stale data so the Failed card renders cleanly on reload.
+      sessionStorage.removeItem('trainDone');
+    }
     window.location.reload();
   });
 
@@ -973,9 +1011,19 @@ function maybeStartSSE() {
     var d = JSON.parse(e.data);
     TRAINING_RUNNING = false;
     sseSource.close();
-    // Persist completion data (model was saved even though training was stopped).
+    // Model was saved even though training was stopped early.
     d._badge = 'Stopped';
     sessionStorage.setItem('trainDone', JSON.stringify(d));
+    window.location.reload();
+  });
+
+  sseSource.addEventListener('failed', function(e) {
+    var d;
+    try { d = JSON.parse(e.data); } catch (ex) { d = {}; }
+    TRAINING_RUNNING = false;
+    sseSource.close();
+    // Clear any stale Done data so the Failed card is the only one shown.
+    sessionStorage.removeItem('trainDone');
     window.location.reload();
   });
 }

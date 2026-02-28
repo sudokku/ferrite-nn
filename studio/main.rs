@@ -44,7 +44,13 @@ fn main() {
     // Ensure trained_models/ directory exists.
     let _ = std::fs::create_dir_all("trained_models");
 
+    // Each request is dispatched on its own thread so the SSE handler
+    // (which blocks for the entire training duration) does not stall
+    // regular page loads and form submissions.
     for request in server.incoming_requests() {
-        routes::dispatch(request, shared_state.clone());
+        let state_clone = shared_state.clone();
+        std::thread::spawn(move || {
+            routes::dispatch(request, state_clone);
+        });
     }
 }

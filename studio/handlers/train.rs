@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
 use std::thread;
+use std::panic;
 use tiny_http::Response;
 use std::io::Cursor;
 
@@ -62,7 +63,13 @@ pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
             format!("<div class=\"arch-row\"><span class=\"ar-lbl\">Layer {}</span><span class=\"ar-val\">{} neurons — {}</span></div>",
                 i+1, l.size, activation_to_str(&l.activation))
         }).collect();
-        let loss_name = if s.loss == LossType::CrossEntropy { "Cross-Entropy" } else { "MSE" };
+        let loss_name = match s.loss {
+            LossType::CrossEntropy       => "Cross-Entropy",
+            LossType::BinaryCrossEntropy => "Binary Cross-Entropy",
+            LossType::Mae                => "Mean Absolute Error",
+            LossType::Huber              => "Huber",
+            LossType::Mse                => "MSE",
+        };
         format!(
             r#"<div class="arch-summary-grid" style="margin-bottom:12px">
               <div class="arch-row"><span class="ar-lbl">Model name</span><span class="ar-val">{name}</span></div>
@@ -224,20 +231,58 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         config.progress_tx = Some(tx);
         config.stop_flag   = Some(stop_flag.clone());
 
+        println!(
+            "[studio] Training started: model='{}', samples={}, val={}, epochs={}, batch_size={}, lr={}",
+            spec.name,
+            ds.train_inputs.len(),
+            ds.val_inputs.len(),
+            hp.epochs,
+            hp.batch_size,
+            hp.learning_rate,
+        );
+
         let t_start = std::time::Instant::now();
 
-        train_loop(
-            &mut network,
-            &ds.train_inputs,
-            &ds.train_labels,
-            val_inputs,
-            val_labels,
-            &optimizer,
-            &config,
-        );
+        // Wrap train_loop in catch_unwind so a panic (e.g. matrix dimension
+        // mismatch or numerical issue) transitions state to Failed instead of
+        // leaving the UI stuck in "Running" forever.
+        let train_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            train_loop(
+                &mut network,
+                &ds.train_inputs,
+                &ds.train_labels,
+                val_inputs,
+                val_labels,
+                &optimizer,
+                &config,
+            )
+        }));
+
+        if let Err(payload) = train_result {
+            let reason = if let Some(s) = payload.downcast_ref::<String>() {
+                format!("Training thread panicked: {}", s)
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                format!("Training thread panicked: {}", s)
+            } else {
+                "Training thread panicked (unknown cause). Check that the \
+                 architecture input size matches the dataset feature count.".to_owned()
+            };
+            eprintln!("[studio] ERROR: {}", reason);
+            let mut st = state_clone.lock().unwrap();
+            st.training = TrainingStatus::Failed { reason };
+            return;
+        }
 
         let elapsed_total_ms = t_start.elapsed().as_millis() as u64;
         let was_stopped = stop_flag.load(Ordering::Relaxed);
+        println!(
+            "[studio] Training finished: {} epochs in {:.1}s{}",
+            // epoch_history is populated by the SSE handler as it receives stats,
+            // but we can count via hp.epochs as a fallback.
+            hp.epochs,
+            elapsed_total_ms as f64 / 1000.0,
+            if was_stopped { " (stopped early)" } else { "" },
+        );
 
         // Save model.
         let model_name = spec.name.clone();
@@ -270,6 +315,7 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         }
 
         if save_ok {
+            println!("[studio] Model saved to '{}'", model_path);
             // Model saved — always transition to Done, regardless of whether
             // the user clicked Stop. `was_stopped` lets the UI distinguish.
             st.training = TrainingStatus::Done {
@@ -278,9 +324,13 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
                 was_stopped,
             };
         } else {
-            st.training = TrainingStatus::Failed {
-                reason: format!("Training finished but could not save model to '{}'.", model_path),
-            };
+            let reason = format!(
+                "Training finished but could not save model to '{}'. \
+                 Check that the process has write permission to the trained_models/ directory.",
+                model_path,
+            );
+            eprintln!("[studio] ERROR: {}", reason);
+            st.training = TrainingStatus::Failed { reason };
         }
         st.trained_network = Some(network);
     });

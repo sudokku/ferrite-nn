@@ -44,8 +44,37 @@ pub fn handle(request: Request, state: SharedState) {
     let rx_arc = match epoch_rx {
         Some(r) => r,
         None    => {
-            // Training is not running; send a done event and close.
-            let _ = write_all(&mut writer, b"event: done\ndata: {}\n\n");
+            // Training is not Running — emit an event matching the actual state.
+            let msg = {
+                let st = state.lock().unwrap();
+                match &st.training {
+                    TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => {
+                        let ep    = st.epoch_history.len();
+                        let total = st.hyperparams.as_ref().map(|h| h.epochs).unwrap_or(0);
+                        if *was_stopped {
+                            format!(
+                                "event: stopped\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}\n\n",
+                                mp=model_path, el=elapsed_total_ms, ep=ep, total=total,
+                            )
+                        } else {
+                            format!(
+                                "event: done\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}\n\n",
+                                mp=model_path, el=elapsed_total_ms, ep=ep,
+                            )
+                        }
+                    }
+                    TrainingStatus::Failed { reason } => {
+                        format!(
+                            "event: failed\ndata: {{\"reason\":\"{}\"}}\n\n",
+                            reason.replace('"', "\\\""),
+                        )
+                    }
+                    _ => String::new(), // Idle — close without event
+                }
+            };
+            if !msg.is_empty() {
+                let _ = write_all(&mut writer, msg.as_bytes());
+            }
             return;
         }
     };
@@ -115,10 +144,18 @@ pub fn handle(request: Request, state: SharedState) {
                                 )
                             }
                         }
-                        _ => "event: done\ndata: {}\n\n".to_owned(),
+                        TrainingStatus::Failed { reason } => {
+                            format!(
+                                "event: failed\ndata: {{\"reason\":\"{}\"}}\n\n",
+                                reason.replace('"', "\\\""),
+                            )
+                        }
+                        _ => String::new(), // Idle — close without event
                     }
                 };
-                let _ = write_all(&mut writer, training_status_json.as_bytes());
+                if !training_status_json.is_empty() {
+                    let _ = write_all(&mut writer, training_status_json.as_bytes());
+                }
                 return;
             }
         }

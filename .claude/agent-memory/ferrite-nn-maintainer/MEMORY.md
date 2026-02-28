@@ -42,7 +42,7 @@ studio/
   handlers/
     mod.rs                 — declares all handler modules
     architect.rs           — GET/POST /architect, /architect/save
-    dataset.rs             — GET/POST /dataset, /dataset/upload, /dataset/builtin
+    dataset.rs             — GET/POST /dataset, /dataset/upload, /dataset/upload-idx, /dataset/builtin
     train.rs               — GET/POST /train, /train/start, /train/stop
     train_sse.rs           — GET /train/events (SSE; takes Request by value for streaming)
     evaluate.rs            — GET /evaluate, /evaluate/export
@@ -51,8 +51,9 @@ studio/
   util/
     mod.rs                 — declares all util modules
     form.rs                — url_decode, parse_form, form_get
-    multipart.rs           — extract_boundary, multipart_extract_file, extract_text_field, extract_all_text_fields
+    multipart.rs           — extract_boundary, multipart_extract_file, multipart_extract_file_by_name, extract_text_field, extract_all_text_fields
     csv.rs                 — parse_csv (LabelMode: ClassIndex/OneHot), builtin_xor/circles/blobs
+    idx.rs                 — parse_idx_pair(&image_bytes, &label_bytes, n_classes) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), String>
     sse.rs                 — SSE helpers (mostly unused; train_sse writes raw HTTP)
     image.rs               — image_bytes_to_grayscale_input, image_bytes_to_rgb_input
   assets/
@@ -125,6 +126,15 @@ trained_models/            — Project-root model storage (NOT examples/trained_
 - `rand = "0.8.5"`, `serde/serde_json = "1"`, `tiny_http = "0.12"`, `image = "0.24"` (all in `[dependencies]`).
 - No `[dev-dependencies]` section.
 - `tiny_http::Request::into_writer()` returns `Box<dyn Write + Send>` directly (not Result).
+
+## Dataset: IDX Format Support
+
+- `studio/util/idx.rs`: `parse_idx_pair` validates IDX3 image + IDX1 label files and returns `(inputs, labels)` compatible with `build_dataset_state`.
+- `multipart_extract_file_by_name(body, boundary, field_name)` added to multipart.rs: picks a file part by its form `name=` attribute (needed when a form has multiple file inputs).
+- `MAX_IDX_BYTES = 100 MB` (MNIST train ~47 MB; allow headroom).
+- Dataset tab has three toggle panels: "upload" (CSV), "idx" (IDX/MNIST), "builtin". Template placeholders: `{{DS_IDX_ACTIVE}}`, `{{DS_IDX_HIDE}}`.
+- `build_dataset_page` active_panel values: `"upload"`, `"idx"`, `"builtin"`.
+- IDX handler derives `source_name` as `"IDX upload (N samples, S×S px, C classes)"` using `sqrt(n_pixels)` for a best-effort square dimension.
 
 ## Known Patterns / Gotchas
 

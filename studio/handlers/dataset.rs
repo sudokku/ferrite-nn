@@ -4,12 +4,15 @@ use std::io::Cursor;
 use crate::state::{DatasetState, FlashMessage, SharedState};
 use crate::util::form::{parse_form, form_get};
 use crate::util::multipart::{extract_boundary, multipart_extract_file,
+                              multipart_extract_file_by_name,
                               extract_all_text_fields};
 use crate::util::csv::{parse_csv, LabelMode, builtin_xor, builtin_circles, builtin_blobs};
+use crate::util::idx::parse_idx_pair;
 use crate::render::{render_page, Page};
 use crate::handlers::architect::{render_flash_html, html_escape};
 
 const MAX_CSV_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+const MAX_IDX_BYTES: usize = 100 * 1024 * 1024; // 100 MB (MNIST train set is ~47 MB)
 
 // ---------------------------------------------------------------------------
 // GET /dataset
@@ -156,6 +159,84 @@ pub fn handle_builtin(request: &mut Request, state: SharedState) -> Response<Cur
 }
 
 // ---------------------------------------------------------------------------
+// POST /dataset/upload-idx
+// ---------------------------------------------------------------------------
+
+pub fn handle_upload_idx(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
+    let content_type = request.headers().iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_owned())
+        .unwrap_or_default();
+
+    let boundary = match extract_boundary(&content_type) {
+        Some(b) => b,
+        None    => return show_error(&state, "Invalid multipart request.", "idx"),
+    };
+
+    let mut body: Vec<u8> = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body);
+
+    if body.len() > MAX_IDX_BYTES {
+        return show_error(&state, "Upload exceeds 100 MB limit.", "idx");
+    }
+
+    let image_bytes = match multipart_extract_file_by_name(&body, &boundary, "images_file") {
+        Some(b) if !b.is_empty() => b,
+        _ => return show_error(&state, "No IDX image file was uploaded (field: images_file).", "idx"),
+    };
+
+    let label_bytes = match multipart_extract_file_by_name(&body, &boundary, "labels_file") {
+        Some(b) if !b.is_empty() => b,
+        _ => return show_error(&state, "No IDX label file was uploaded (field: labels_file).", "idx"),
+    };
+
+    // Parse text fields from multipart.
+    let fields = extract_all_text_fields(&body, &boundary);
+    let field_get = |k: &str| fields.iter().find(|(name,_)| name == k).map(|(_,v)| v.as_str()).unwrap_or("");
+
+    let val_split: u8  = field_get("val_split").trim().parse().unwrap_or(10).min(50);
+    let n_classes: usize = field_get("n_classes").trim().parse().unwrap_or(10).max(2);
+
+    let (inputs, labels) = match parse_idx_pair(&image_bytes, &label_bytes, n_classes) {
+        Ok(r)  => r,
+        Err(e) => return show_error(&state, &e, "idx"),
+    };
+
+    // Validate feature count against the currently-loaded architecture spec.
+    {
+        let st = state.lock().unwrap();
+        if let Some(spec) = &st.spec {
+            let expected = spec.layers.first().map(|l| l.input_size).unwrap_or(0);
+            if expected > 0 && !inputs.is_empty() && inputs[0].len() != expected {
+                let err = format!(
+                    "Feature count mismatch: model expects {} inputs, IDX images have {} pixels.",
+                    expected, inputs[0].len()
+                );
+                drop(st);
+                return show_error(&state, &err, "idx");
+            }
+        }
+    }
+
+    let source_name = format!("IDX upload ({} samples, {}×{} px, {} classes)",
+        inputs.len(),
+        // derive rows/cols from pixel count — best effort
+        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
+        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
+        n_classes,
+    );
+
+    let ds = build_dataset_state(inputs, labels, val_split, source_name);
+
+    let mut st = state.lock().unwrap();
+    st.dataset = Some(ds);
+    st.flash   = Some(FlashMessage::success("IDX dataset loaded successfully."));
+    drop(st);
+
+    crate::routes::redirect("/dataset")
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -214,10 +295,12 @@ fn build_dataset_page(
         format!(r#"<div class="flash flash-error" style="margin-top:14px">{}</div>"#, html_escape(e))
     }).unwrap_or_default();
 
-    let upload_active  = if active_panel == "upload" { "active" } else { "" };
+    let upload_active  = if active_panel == "upload"  { "active" } else { "" };
     let builtin_active = if active_panel == "builtin" { "active" } else { "" };
-    let upload_hide    = if active_panel == "builtin" { "hidden" } else { "" };
-    let builtin_hide   = if active_panel == "upload" { "hidden" } else { "" };
+    let idx_active     = if active_panel == "idx"     { "active" } else { "" };
+    let upload_hide    = if active_panel != "upload"  { "hidden" } else { "" };
+    let builtin_hide   = if active_panel != "builtin" { "hidden" } else { "" };
+    let idx_hide       = if active_panel != "idx"     { "hidden" } else { "" };
 
     let summary_html = ds.as_ref().map(build_summary_html).unwrap_or_default();
 
@@ -226,8 +309,10 @@ fn build_dataset_page(
             .replace("{{FLASH_DATASET}}", &flash_html)
             .replace("{{DS_UPLOAD_ACTIVE}}", upload_active)
             .replace("{{DS_BUILTIN_ACTIVE}}", builtin_active)
+            .replace("{{DS_IDX_ACTIVE}}", idx_active)
             .replace("{{DS_UPLOAD_HIDE}}", upload_hide)
             .replace("{{DS_BUILTIN_HIDE}}", builtin_hide)
+            .replace("{{DS_IDX_HIDE}}", idx_hide)
             .replace("{{DS_VAL_SPLIT}}", "20")
             .replace("{{SEL_CI}}", " selected")
             .replace("{{SEL_OH}}", "")

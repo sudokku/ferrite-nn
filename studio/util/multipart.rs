@@ -113,6 +113,34 @@ pub fn extract_all_text_fields(body: &[u8], boundary: &str) -> Vec<(String, Stri
     result
 }
 
+/// Extracts the raw bytes of a named file part from a multipart/form-data body.
+///
+/// Unlike `multipart_extract_file` which returns the first file encountered,
+/// this function matches on the `name="<field_name>"` attribute so you can
+/// pick a specific upload field when a form contains multiple file inputs.
+pub fn multipart_extract_file_by_name(body: &[u8], boundary: &str, field_name: &str) -> Option<Vec<u8>> {
+    let delimiter = format!("--{}", boundary);
+    let delim_bytes = delimiter.as_bytes();
+    let parts = split_on(body, delim_bytes);
+
+    for part in parts {
+        let sep = b"\r\n\r\n";
+        if let Some(sep_pos) = find_subsequence(part, sep) {
+            let header_section = &part[..sep_pos];
+            let headers_str = String::from_utf8_lossy(header_section);
+            let has_name     = headers_str.contains(&format!("name=\"{}\"", field_name));
+            let has_filename = headers_str.contains("filename=");
+            if has_name && has_filename {
+                let data_start = sep_pos + sep.len();
+                let raw = &part[data_start..];
+                let trimmed = raw.strip_suffix(b"\r\n").unwrap_or(raw);
+                return Some(trimmed.to_vec());
+            }
+        }
+    }
+    None
+}
+
 /// Parses the `name="..."` value from a Content-Disposition header string.
 fn parse_disposition_name(headers: &str) -> Option<String> {
     let key = "name=\"";

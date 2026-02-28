@@ -93,19 +93,27 @@ pub fn handle(request: Request, state: SharedState) {
                 let training_status_json = {
                     let st = state.lock().unwrap();
                     match &st.training {
-                        TrainingStatus::Done { model_path, elapsed_total_ms } => {
-                            let ep = st.epoch_history.len();
-                            format!(
-                                "event: done\ndata: {{\"model_path\":\"{}\",\"elapsed_total_ms\":{},\"epochs_completed\":{}}}\n\n",
-                                model_path, elapsed_total_ms, ep
-                            )
-                        }
-                        TrainingStatus::Stopped { epochs_completed } => {
+                        TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => {
+                            let ep    = st.epoch_history.len();
                             let total = st.hyperparams.as_ref().map(|h| h.epochs).unwrap_or(0);
-                            format!(
-                                "event: stopped\ndata: {{\"epoch_reached\":{},\"total_epochs\":{}}}\n\n",
-                                epochs_completed, total
-                            )
+                            if *was_stopped {
+                                // User stopped training; model still saved — emit stopped event
+                                // with the model path so the client can persist it.
+                                format!(
+                                    "event: stopped\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}\n\n",
+                                    mp    = model_path,
+                                    el    = elapsed_total_ms,
+                                    ep    = ep,
+                                    total = total,
+                                )
+                            } else {
+                                format!(
+                                    "event: done\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}\n\n",
+                                    mp = model_path,
+                                    el = elapsed_total_ms,
+                                    ep = ep,
+                                )
+                            }
                         }
                         _ => "event: done\ndata: {}\n\n".to_owned(),
                     }

@@ -5,7 +5,8 @@ use ferrite_nn::{ActivationFunction, InputType, Network};
 
 use crate::state::SharedState;
 use crate::util::form::{parse_form, form_get};
-use crate::util::multipart::{extract_boundary, multipart_extract_file, extract_text_field};
+use crate::util::multipart::{extract_boundary, multipart_extract_file, extract_text_field,
+                              find_subsequence, split_on};
 use crate::util::image::{image_bytes_to_grayscale_input, image_bytes_to_rgb_input};
 use crate::render::{render_page, Page};
 use crate::handlers::architect::html_escape;
@@ -328,4 +329,110 @@ fn format_raw(output: &[f64]) -> String {
 
 fn error_html(msg: &str) -> String {
     format!(r#"<div class="result-card"><h2>Error</h2><div class="error-box">{}</div></div>"#, msg)
+}
+
+// ---------------------------------------------------------------------------
+// POST /test/import-model
+// ---------------------------------------------------------------------------
+
+pub fn handle_import_model(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
+    let st   = state.lock().unwrap();
+    let mask = st.tab_unlock_mask();
+    drop(st);
+
+    let content_type = request.headers().iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_owned())
+        .unwrap_or_default();
+
+    let boundary = match extract_boundary(&content_type) {
+        Some(b) => b,
+        None    => {
+            let page = build_test_page("", &error_html("Invalid multipart request."), mask);
+            return crate::routes::html_response(page);
+        }
+    };
+
+    let mut body: Vec<u8> = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body);
+
+    // Extract file bytes.
+    let file_bytes = match multipart_extract_file(&body, &boundary) {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            let page = build_test_page("", &error_html("No JSON file was uploaded."), mask);
+            return crate::routes::html_response(page);
+        }
+    };
+
+    // Basic JSON validation: must deserialize and contain a "layers" key.
+    let json_val: serde_json::Value = match serde_json::from_slice(&file_bytes) {
+        Ok(v)  => v,
+        Err(_) => {
+            let page = build_test_page("", &error_html("Uploaded file is not valid JSON."), mask);
+            return crate::routes::html_response(page);
+        }
+    };
+    if json_val.get("layers").is_none() {
+        let page = build_test_page("", &error_html("JSON does not appear to be a Ferrite model (missing \"layers\" field)."), mask);
+        return crate::routes::html_response(page);
+    }
+
+    // Extract the original filename from multipart headers.
+    let raw_filename = extract_upload_filename(&body, &boundary)
+        .unwrap_or_else(|| "imported_model".to_owned());
+
+    // Strip path components and .json extension, then sanitize.
+    let stem = std::path::Path::new(&raw_filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("imported_model");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let model_name = if sanitized.is_empty() { "imported_model".to_owned() } else { sanitized };
+
+    // Write to trained_models/.
+    let model_dir  = "trained_models";
+    let model_path = format!("{}/{}.json", model_dir, model_name);
+    if let Err(_) = std::fs::create_dir_all(model_dir) {
+        let page = build_test_page("", &error_html("Could not create trained_models/ directory."), mask);
+        return crate::routes::html_response(page);
+    }
+    if let Err(_) = std::fs::write(&model_path, &file_bytes) {
+        let page = build_test_page("", &error_html(&format!("Could not write model to '{}'.", model_path)), mask);
+        return crate::routes::html_response(page);
+    }
+
+    // Redirect to /test?model=<name> so the new model is selected.
+    crate::routes::redirect(&format!("/test?model={}", model_name))
+}
+
+/// Extracts the `filename="..."` value from the first file part of a multipart body.
+fn extract_upload_filename(body: &[u8], boundary: &str) -> Option<String> {
+    let delimiter = format!("--{}", boundary);
+    let delim_bytes = delimiter.as_bytes();
+    let parts = split_on(body, delim_bytes);
+
+    for part in &parts {
+        let sep = b"\r\n\r\n";
+        if let Some(sep_pos) = find_subsequence(part, sep) {
+            let header_section = &part[..sep_pos];
+            let headers_str = String::from_utf8_lossy(header_section);
+            // Only file parts have filename=.
+            if !headers_str.contains("filename=") {
+                continue;
+            }
+            // Parse filename="..." or filename=...
+            let key = "filename=\"";
+            if let Some(pos) = headers_str.find(key) {
+                let rest = &headers_str[pos + key.len()..];
+                if let Some(end) = rest.find('"') {
+                    return Some(rest[..end].to_owned());
+                }
+            }
+        }
+    }
+    None
 }

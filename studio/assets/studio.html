@@ -437,9 +437,12 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
 <div class="two-col" style="margin-top:22px">
 <div>
 <label for="loss-type">Loss function</label>
-<select id="loss-type" name="loss_type">
+<select id="loss-type" name="loss_type" onchange="updateWarning()">
   <option value="mse"{{SEL_MSE}}>Mean Squared Error (MSE)</option>
   <option value="cross_entropy"{{SEL_CE}}>Cross-Entropy (Softmax)</option>
+  <option value="bce"{{SEL_BCE}}>Binary Cross-Entropy (Sigmoid)</option>
+  <option value="mae"{{SEL_MAE}}>Mean Absolute Error (MAE)</option>
+  <option value="huber"{{SEL_HUBER}}>Huber Loss (δ=1.0)</option>
 </select>
 </div>
 </div>
@@ -575,7 +578,7 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
 {{TRAIN_ARCH_SUMMARY}}
 {{TRAIN_DATA_SUMMARY}}
 <div class="mt">
-  <form method="POST" action="/train/start">
+  <form method="POST" action="/train/start" onsubmit="sessionStorage.removeItem('trainDone')">
     {{TRAIN_ERROR}}
     <button type="submit" class="btn btn-primary">Start Training</button>
   </form>
@@ -625,9 +628,9 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
 <div id="train-done-card" class="card {{TRAIN_DONE_HIDE}}">
 <h2>Training Complete <span class="badge badge-done" id="done-badge">{{TRAIN_STATUS_BADGE}}</span></h2>
 {{TRAIN_DONE_STATS}}
-<div class="mt" style="display:flex; gap:12px; flex-wrap:wrap">
+<div class="mt" id="done-actions" style="display:flex; gap:12px; flex-wrap:wrap">
   <a href="/evaluate" class="btn btn-primary">Go to Evaluate</a>
-  {{TRAIN_DOWNLOAD_LINK}}
+  <span id="done-download-link-js">{{TRAIN_DOWNLOAD_LINK}}</span>
 </div>
 </div><!-- done card -->
 
@@ -683,6 +686,14 @@ progress::-moz-progress-bar { background: #2563eb; border-radius: 5px; }
   {{MODEL_OPTIONS}}
 </select>
 
+<details style="margin-top:14px">
+  <summary style="cursor:pointer;color:#2563eb">Import a model JSON file</summary>
+  <form method="POST" action="/test/import-model" enctype="multipart/form-data" style="margin-top:10px">
+    <input type="file" name="model_file" accept=".json" required>
+    <button type="submit" class="btn btn-secondary" style="margin-left:8px">Upload &amp; Select</button>
+  </form>
+</details>
+
 {{TEST_INPUT_SECTION}}
 
 {{TEST_RESULT_SECTION}}
@@ -708,8 +719,12 @@ function switchTab(n) {
   document.getElementById('tb-' + n).classList.add('active');
   document.getElementById('tp-' + n).style.display = 'block';
 
-  // Start SSE if switching to Train and training is running.
-  if (n === 2) maybeStartSSE();
+  if (n === 2) {
+    // Start SSE if switching to Train and training is running.
+    maybeStartSSE();
+    // Restore done-card content from sessionStorage if training is not running.
+    restoreTrainDone();
+  }
 }
 
 function initTabs() {
@@ -724,6 +739,65 @@ function initTabs() {
 initTabs();
 
 // ---------------------------------------------------------------------------
+// Train: restore done-card content from sessionStorage on client tab switch.
+//
+// When the server renders a non-Train page it blanks all {{TRAIN_*}} tokens,
+// leaving the done card empty. This function re-populates it from the data
+// we persisted in sessionStorage when the SSE done/stopped event fired.
+// ---------------------------------------------------------------------------
+function restoreTrainDone() {
+  if (TRAINING_RUNNING) return; // live data takes precedence
+  var raw = sessionStorage.getItem('trainDone');
+  if (!raw) return;
+  var d;
+  try { d = JSON.parse(raw); } catch (ex) { return; }
+
+  var doneCard    = document.getElementById('train-done-card');
+  var liveCard    = document.getElementById('train-live-card');
+  var summaryCard = document.getElementById('train-summary-card');
+  if (!doneCard) return;
+
+  // Show done card, hide the others.
+  doneCard.classList.remove('hidden');
+  doneCard.style.display = 'block';
+  if (liveCard)    { liveCard.classList.add('hidden');    liveCard.style.display    = 'none'; }
+  if (summaryCard) { summaryCard.classList.add('hidden'); summaryCard.style.display = 'none'; }
+
+  // Update status badge.
+  var badge = document.getElementById('done-badge');
+  if (badge) badge.textContent = d._badge || 'Done';
+
+  // Populate metrics inside the existing #done-stats-js container if present.
+  var statsEl = document.getElementById('done-stats-js');
+  if (statsEl) {
+    var elapsed = (d.elapsed_total_ms !== undefined)
+      ? (d.elapsed_total_ms / 1000).toFixed(1) + 's'
+      : (d.epoch_reached !== undefined ? 'stopped at epoch ' + d.epoch_reached : '—');
+    statsEl.innerHTML =
+      '<div class="metrics-row">' +
+        '<div class="metric-card"><div class="val" style="font-size:1rem">' + elapsed + '</div><div class="lbl">Total time</div></div>' +
+        (d.epochs_completed !== undefined
+          ? '<div class="metric-card"><div class="val" style="font-size:1rem">' + d.epochs_completed + '</div><div class="lbl">Epochs</div></div>'
+          : '') +
+      '</div>';
+    if (d.model_path) {
+      statsEl.innerHTML +=
+        '<p style="margin-top:12px;font-size:.85rem;color:#555">Saved to: <code>' + d.model_path + '</code></p>';
+    }
+  }
+
+  // Populate download link inside #done-download-link-js if present.
+  var dlEl = document.getElementById('done-download-link-js');
+  if (dlEl && d.model_path) {
+    var stem = d.model_path.replace(/.*[\/\\]/, '').replace(/\.json$/, '');
+    if (!dlEl.querySelector('a')) {
+      dlEl.innerHTML =
+        '<a href="/models/' + encodeURIComponent(stem) + '/download" class="btn btn-secondary">Download model JSON</a>';
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Architect: dynamic layer table
 // ---------------------------------------------------------------------------
 var layerCount = 0;
@@ -732,10 +806,21 @@ function addLayer(neurons, activation) {
   layerCount++;
   var n = neurons || 32;
   var a = activation || 'relu';
-  var acts = ['sigmoid','relu','identity','softmax'];
-  var actOpts = acts.map(function(v) {
+  var acts = [
+    ['sigmoid',    'Sigmoid'],
+    ['relu',       'ReLU'],
+    ['tanh',       'Tanh'],
+    ['leaky_relu', 'Leaky ReLU (\u03b1=0.01)'],
+    ['elu',        'ELU (\u03b1=1.0)'],
+    ['gelu',       'GELU'],
+    ['swish',      'Swish'],
+    ['identity',   'Identity'],
+    ['softmax',    'Softmax']
+  ];
+  var actOpts = acts.map(function(pair) {
+    var v = pair[0], label = pair[1];
     var sel = (v === a) ? ' selected' : '';
-    return '<option value="' + v + '"' + sel + '>' + v.charAt(0).toUpperCase() + v.slice(1) + '</option>';
+    return '<option value="' + v + '"' + sel + '>' + label + '</option>';
   }).join('');
 
   var tbody = document.getElementById('layer-body');
@@ -789,14 +874,22 @@ function updateWarning() {
   var lastAct = layers.length > 0 ? layers[layers.length - 1].activation : '';
   var lossType = document.getElementById('loss-type').value;
   var warn = document.getElementById('arch-warning');
-  if (warn) {
-    var show = (lastAct === 'softmax' && lossType === 'mse') ||
-               (lastAct !== 'softmax' && lossType === 'cross_entropy' && layers.length > 0);
-    warn.classList.toggle('hidden', !show);
-  }
-}
+  if (!warn) return;
 
-document.getElementById('loss-type').addEventListener('change', updateWarning);
+  var msg = '';
+  if (lastAct === 'softmax' && lossType === 'mse') {
+    msg = 'Last layer uses Softmax but Loss is MSE \u2014 consider using Cross-Entropy instead.';
+  } else if (lastAct !== 'softmax' && lossType === 'cross_entropy' && layers.length > 0) {
+    msg = 'Cross-Entropy loss works best with a Softmax output layer.';
+  } else if (lossType === 'bce' && lastAct !== 'sigmoid') {
+    msg = 'BCE works best with a Sigmoid output layer.';
+  } else if ((lossType === 'mae' || lossType === 'huber') && lastAct !== 'identity') {
+    msg = 'Regression losses (MAE / Huber) work best with an Identity output layer.';
+  }
+
+  warn.textContent = msg;
+  warn.classList.toggle('hidden', msg === '');
+}
 
 // ---------------------------------------------------------------------------
 // Dataset: toggle upload / builtin panels
@@ -870,13 +963,19 @@ function maybeStartSSE() {
     var d = JSON.parse(e.data);
     TRAINING_RUNNING = false;
     sseSource.close();
-    // Reload page to show Done state.
+    // Persist completion data so it survives client-side tab navigation.
+    d._badge = 'Done';
+    sessionStorage.setItem('trainDone', JSON.stringify(d));
     window.location.reload();
   });
 
   sseSource.addEventListener('stopped', function(e) {
+    var d = JSON.parse(e.data);
     TRAINING_RUNNING = false;
     sseSource.close();
+    // Persist completion data (model was saved even though training was stopped).
+    d._badge = 'Stopped';
+    sessionStorage.setItem('trainDone', JSON.stringify(d));
     window.location.reload();
   });
 }
@@ -970,5 +1069,9 @@ if (TRAINING_RUNNING) {
   maybeStartSSE();
 }
 </script>
+
+<footer style="text-align:center; padding:20px; font-size:.78rem; color:#999">
+  <p><a href="https://github.com/sudokku/ferrite-nn" style="color:#8892a4; text-decoration:none">ferrite-nn</a> &mdash; Radu Chirilov</p>
+</footer>
 </body>
 </html>

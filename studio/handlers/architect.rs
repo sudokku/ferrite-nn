@@ -103,7 +103,13 @@ pub fn handle_post(request: &mut Request, state: SharedState) -> Response<Cursor
         prev_size = rl.neurons;
     }
 
-    let loss = if loss_s == "cross_entropy" { LossType::CrossEntropy } else { LossType::Mse };
+    let loss = match loss_s.as_str() {
+        "cross_entropy" => LossType::CrossEntropy,
+        "bce"           => LossType::BinaryCrossEntropy,
+        "mae"           => LossType::Mae,
+        "huber"         => LossType::Huber,
+        _               => LossType::Mse,
+    };
 
     // Enforce Softmax <-> CrossEntropy consistency.
     let last_act = &layer_specs.last().unwrap().activation;
@@ -116,6 +122,12 @@ pub fn handle_post(request: &mut Request, state: SharedState) -> Response<Cursor
     if *last_act != ActivationFunction::Softmax && loss == LossType::CrossEntropy {
         return show_err(
             "Cross-Entropy loss requires a Softmax output layer.",
+            &state,
+        );
+    }
+    if *last_act == ActivationFunction::Softmax && loss == LossType::BinaryCrossEntropy {
+        return show_err(
+            "Binary Cross-Entropy loss must not be paired with a Softmax output. Use Sigmoid instead.",
             &state,
         );
     }
@@ -182,8 +194,11 @@ fn build_arch_page(
                 html_escape(e))
     }).unwrap_or_default();
 
-    let sel_mse = if loss == LossType::Mse { " selected" } else { "" };
-    let sel_ce  = if loss == LossType::CrossEntropy { " selected" } else { "" };
+    let sel_mse   = if loss == LossType::Mse                { " selected" } else { "" };
+    let sel_ce    = if loss == LossType::CrossEntropy        { " selected" } else { "" };
+    let sel_bce   = if loss == LossType::BinaryCrossEntropy  { " selected" } else { "" };
+    let sel_mae   = if loss == LossType::Mae                 { " selected" } else { "" };
+    let sel_huber = if loss == LossType::Huber               { " selected" } else { "" };
 
     render_page(Page::Architect, tab_unlock, false, |tmpl| {
         tmpl
@@ -194,6 +209,9 @@ fn build_arch_page(
             .replace("{{LAYER_ROWS}}", &layer_rows)
             .replace("{{SEL_MSE}}", sel_mse)
             .replace("{{SEL_CE}}", sel_ce)
+            .replace("{{SEL_BCE}}", sel_bce)
+            .replace("{{SEL_MAE}}", sel_mae)
+            .replace("{{SEL_HUBER}}", sel_huber)
             .replace("{{ARCH_LR}}", &lr.to_string())
             .replace("{{ARCH_BS}}", &bs.to_string())
             .replace("{{ARCH_EP}}", &ep.to_string())
@@ -201,14 +219,25 @@ fn build_arch_page(
     })
 }
 
+const ACTIVATION_OPTIONS: &[(&str, &str)] = &[
+    ("sigmoid",    "Sigmoid"),
+    ("relu",       "ReLU"),
+    ("tanh",       "Tanh"),
+    ("leaky_relu", "Leaky ReLU (α=0.01)"),
+    ("elu",        "ELU (α=1.0)"),
+    ("gelu",       "GELU"),
+    ("swish",      "Swish"),
+    ("identity",   "Identity"),
+    ("softmax",    "Softmax"),
+];
+
 fn build_layer_rows(layers: &[LayerSpec]) -> String {
     layers.iter().enumerate().map(|(i, ls)| {
         let idx     = i + 1;
         let act_str = activation_to_str(&ls.activation);
-        let opts: String = ["sigmoid","relu","identity","softmax"].iter().map(|&a| {
-            let sel = if a == act_str { " selected" } else { "" };
-            let label = a[..1].to_uppercase() + &a[1..];
-            format!("<option value=\"{}\"{}>{}</option>", a, sel, label)
+        let opts: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
+            let sel = if val == act_str { " selected" } else { "" };
+            format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
         }).collect();
         format!(
             r#"<tr id="lr-{idx}"><td>{idx}</td><td><input type="number" class="neurons-input" data-field="neurons" value="{sz}" min="1"></td><td><select class="act-select" data-field="activation">{opts}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer({idx})">Remove</button></td></tr>"#,
@@ -218,8 +247,19 @@ fn build_layer_rows(layers: &[LayerSpec]) -> String {
 }
 
 fn default_layer_rows() -> String {
-    r#"<tr id="lr-1"><td>1</td><td><input type="number" class="neurons-input" data-field="neurons" value="8" min="1"></td><td><select class="act-select" data-field="activation"><option value="sigmoid">Sigmoid</option><option value="relu" selected>Relu</option><option value="identity">Identity</option><option value="softmax">Softmax</option></select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(1)">Remove</button></td></tr>
-<tr id="lr-2"><td>2</td><td><input type="number" class="neurons-input" data-field="neurons" value="2" min="1"></td><td><select class="act-select" data-field="activation"><option value="sigmoid">Sigmoid</option><option value="relu">Relu</option><option value="identity">Identity</option><option value="softmax" selected>Softmax</option></select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(2)">Remove</button></td></tr>"#.to_owned()
+    let opts_relu: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
+        let sel = if val == "relu" { " selected" } else { "" };
+        format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
+    }).collect();
+    let opts_softmax: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
+        let sel = if val == "softmax" { " selected" } else { "" };
+        format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
+    }).collect();
+    format!(
+        r#"<tr id="lr-1"><td>1</td><td><input type="number" class="neurons-input" data-field="neurons" value="8" min="1"></td><td><select class="act-select" data-field="activation">{}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(1)">Remove</button></td></tr>
+<tr id="lr-2"><td>2</td><td><input type="number" class="neurons-input" data-field="neurons" value="2" min="1"></td><td><select class="act-select" data-field="activation">{}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(2)">Remove</button></td></tr>"#,
+        opts_relu, opts_softmax
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -228,19 +268,29 @@ fn default_layer_rows() -> String {
 
 pub fn parse_activation(s: &str) -> ActivationFunction {
     match s {
-        "relu"     => ActivationFunction::ReLU,
-        "softmax"  => ActivationFunction::Softmax,
-        "identity" => ActivationFunction::Identity,
-        _          => ActivationFunction::Sigmoid,
+        "relu"       => ActivationFunction::ReLU,
+        "softmax"    => ActivationFunction::Softmax,
+        "identity"   => ActivationFunction::Identity,
+        "tanh"       => ActivationFunction::Tanh,
+        "leaky_relu" => ActivationFunction::LeakyReLU { alpha: 0.01 },
+        "elu"        => ActivationFunction::Elu { alpha: 1.0 },
+        "gelu"       => ActivationFunction::Gelu,
+        "swish"      => ActivationFunction::Swish,
+        _            => ActivationFunction::Sigmoid,
     }
 }
 
 pub fn activation_to_str(a: &ActivationFunction) -> &'static str {
     match a {
-        ActivationFunction::ReLU     => "relu",
-        ActivationFunction::Softmax  => "softmax",
-        ActivationFunction::Identity => "identity",
-        ActivationFunction::Sigmoid  => "sigmoid",
+        ActivationFunction::ReLU             => "relu",
+        ActivationFunction::Softmax          => "softmax",
+        ActivationFunction::Identity         => "identity",
+        ActivationFunction::Sigmoid          => "sigmoid",
+        ActivationFunction::Tanh             => "tanh",
+        ActivationFunction::LeakyReLU { .. } => "leaky_relu",
+        ActivationFunction::Elu { .. }       => "elu",
+        ActivationFunction::Gelu             => "gelu",
+        ActivationFunction::Swish            => "swish",
     }
 }
 

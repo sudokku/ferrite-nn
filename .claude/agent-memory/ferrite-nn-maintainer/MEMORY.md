@@ -107,6 +107,19 @@ trained_models/            — Project-root model storage (NOT examples/trained_
 - Trained models saved to `trained_models/<name>.json` (project root).
 - `studio.html` uses `{{PLACEHOLDER}}` tokens; `render.rs` blanks any unfilled ones.
 
+## TrainingStatus enum (state.rs)
+
+- `Stopped` variant **removed**. Stopping training now produces `Done { was_stopped: true, .. }`.
+- `Done` fields: `model_path: String`, `elapsed_total_ms: u64`, `was_stopped: bool`.
+- Model is always saved after training loop, regardless of whether the user clicked Stop.
+- `tab_unlock_mask()` only matches `Done { .. }` (Stopped was removed).
+- All handlers that previously matched `Stopped` must now check `Done { was_stopped, .. }`.
+- SSE: emits `event: stopped` (with `model_path`) when `was_stopped=true`, `event: done` otherwise.
+- XOR built-in dataset forces `val_split=0` (4 samples — validation split is misleading).
+- Test tab has `POST /test/import-model` route; uses `find_subsequence`/`split_on` from multipart util.
+- Train done card: `build_done_stats` adds `id="done-stats-js"` and "Saved to:" path line.
+- studio.html: `restoreTrainDone()` repopulates done card from `sessionStorage` on client tab switch.
+
 ## Dependencies
 
 - `rand = "0.8.5"`, `serde/serde_json = "1"`, `tiny_http = "0.12"`, `image = "0.24"` (all in `[dependencies]`).

@@ -121,8 +121,9 @@ pub fn dispatch(mut request: Request, state: SharedState) {
         (Method::Get, "/evaluate/export") => handlers::evaluate::handle_export(state),
 
         // ── Test ─────────────────────────────────────────────────────────
-        (Method::Get,  "/test")        => handlers::test::handle_get(query, state),
-        (Method::Post, "/test/infer")  => handlers::test::handle_infer(&mut request, state),
+        (Method::Get,  "/test")               => handlers::test::handle_get(query, state),
+        (Method::Post, "/test/infer")         => handlers::test::handle_infer(&mut request, state),
+        (Method::Post, "/test/import-model")  => handlers::test::handle_import_model(&mut request, state),
 
         // ── 404 ──────────────────────────────────────────────────────────
         _ => not_found(),

@@ -24,11 +24,10 @@ pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
     let history    = st.epoch_history.clone();
 
     let (show_summary, show_live, show_done, show_failed) = match training {
-        TrainingStatus::Idle                => (true,  false, false, false),
-        TrainingStatus::Running { .. }      => (false, true,  false, false),
-        TrainingStatus::Done    { .. }      => (false, false, true,  false),
-        TrainingStatus::Stopped { .. }      => (false, false, true,  false),
-        TrainingStatus::Failed  { .. }      => (false, false, false, true),
+        TrainingStatus::Idle           => (true,  false, false, false),
+        TrainingStatus::Running { .. } => (false, true,  false, false),
+        TrainingStatus::Done    { .. } => (false, false, true,  false),
+        TrainingStatus::Failed  { .. } => (false, false, false, true),
     };
 
     let is_running = matches!(training, TrainingStatus::Running { .. });
@@ -39,8 +38,8 @@ pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
     };
 
     let done_badge = match training {
-        TrainingStatus::Done    { .. }         => "Done",
-        TrainingStatus::Stopped { .. }         => "Stopped",
+        TrainingStatus::Done { was_stopped: true,  .. } => "Stopped",
+        TrainingStatus::Done { was_stopped: false, .. } => "Done",
         _ => "",
     };
 
@@ -116,41 +115,57 @@ fn build_done_stats(training: &TrainingStatus, history: &[ferrite_nn::EpochStats
         s.val_accuracy.map(|v| format!("{:.2}%", v * 100.0)).unwrap_or_else(|| "—".into()),
     )).unwrap_or_else(|| ("—".into(), "—".into(), "—".into(), "—".into()));
 
-    let elapsed_total = match training {
-        TrainingStatus::Done { elapsed_total_ms, .. } => {
-            format!("{:.1}s", *elapsed_total_ms as f64 / 1000.0)
+    let (elapsed_total, saved_path) = match training {
+        TrainingStatus::Done { elapsed_total_ms, model_path, was_stopped } => {
+            let elapsed = if *was_stopped {
+                format!("stopped at epoch {}", history.len())
+            } else {
+                format!("{:.1}s", *elapsed_total_ms as f64 / 1000.0)
+            };
+            (elapsed, model_path.clone())
         }
-        TrainingStatus::Stopped { epochs_completed } => {
-            format!("stopped at epoch {}", epochs_completed)
-        }
-        _ => "—".into(),
+        _ => ("—".into(), String::new()),
+    };
+
+    let saved_line = if saved_path.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p style="margin-top:12px;font-size:.85rem;color:#555">Saved to: <code>{}</code></p>"#,
+            html_escape(&saved_path)
+        )
     };
 
     format!(
-        r#"<div class="metrics-row">
+        r#"<div class="metrics-row" id="done-stats-js">
           <div class="metric-card"><div class="val">{train_loss}</div><div class="lbl">Train loss</div></div>
           <div class="metric-card"><div class="val">{val_loss}</div><div class="lbl">Val loss</div></div>
           <div class="metric-card"><div class="val">{train_acc}</div><div class="lbl">Train acc</div></div>
           <div class="metric-card"><div class="val">{val_acc}</div><div class="lbl">Val acc</div></div>
           <div class="metric-card"><div class="val" style="font-size:1rem">{elapsed}</div><div class="lbl">Total time</div></div>
-        </div>"#,
-        train_loss = train_loss, val_loss = val_loss,
-        train_acc  = train_acc, val_acc   = val_acc,
-        elapsed    = elapsed_total,
+        </div>
+        {saved_line}
+        <div id="done-download-js"></div>"#,
+        train_loss  = train_loss,
+        val_loss    = val_loss,
+        train_acc   = train_acc,
+        val_acc     = val_acc,
+        elapsed     = elapsed_total,
+        saved_line  = saved_line,
     )
 }
 
 fn build_download_link(training: &TrainingStatus) -> String {
     match training {
         TrainingStatus::Done { model_path, .. } => {
-            // Extract stem from path.
+            // Extract stem from path for the download route.
             let stem = std::path::Path::new(model_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("model");
             format!(
-                r#"<a href="/models/{}/download" class="btn btn-secondary">Download model JSON</a>"#,
-                html_escape(stem)
+                r#"<a href="/models/{stem}/download" class="btn btn-secondary">Download model JSON</a>"#,
+                stem = html_escape(stem)
             )
         }
         _ => String::new(),
@@ -254,14 +269,13 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
             st.epoch_history.push(s);
         }
 
-        let epochs_completed = st.epoch_history.len();
-
-        if was_stopped {
-            st.training = TrainingStatus::Stopped { epochs_completed };
-        } else if save_ok {
+        if save_ok {
+            // Model saved — always transition to Done, regardless of whether
+            // the user clicked Stop. `was_stopped` lets the UI distinguish.
             st.training = TrainingStatus::Done {
                 model_path: model_path.clone(),
                 elapsed_total_ms,
+                was_stopped,
             };
         } else {
             st.training = TrainingStatus::Failed {

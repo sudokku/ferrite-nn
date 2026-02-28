@@ -108,10 +108,16 @@ pub fn handle_builtin(request: &mut Request, state: SharedState) -> Response<Cur
     let pairs = parse_form(&body);
 
     let name      = form_get(&pairs, "builtin_name").unwrap_or("xor");
-    let val_split: u8 = form_get(&pairs, "val_split")
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(20)
-        .min(50);
+    // XOR has only 4 samples — any validation split causes misleading metrics
+    // because the model never sees the held-out sample(s) during training.
+    let val_split: u8 = if name == "xor" {
+        0
+    } else {
+        form_get(&pairs, "val_split")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(20)
+            .min(50)
+    };
 
     let (inputs, labels, source_name) = match name {
         "circles" => { let (i,l) = builtin_circles(200); (i, l, "Circles (200)".to_owned()) }

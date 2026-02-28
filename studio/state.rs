@@ -54,14 +54,12 @@ pub enum TrainingStatus {
         epoch_rx:     Arc<Mutex<mpsc::Receiver<EpochStats>>>,
         total_epochs: usize,
     },
-    /// Training completed successfully.
+    /// Training completed (naturally or via Stop) and the model was saved.
+    /// `was_stopped` is true when the user clicked Stop before all epochs finished.
     Done {
         model_path:       String,
         elapsed_total_ms: u64,
-    },
-    /// Training was interrupted via the stop button.
-    Stopped {
-        epochs_completed: usize,
+        was_stopped:      bool,
     },
     /// Training failed with an error.
     Failed {
@@ -144,7 +142,7 @@ impl StudioState {
             mask |= 0b0_0100; // Train
         }
         match &self.training {
-            TrainingStatus::Done { .. } | TrainingStatus::Stopped { .. } => {
+            TrainingStatus::Done { .. } => {
                 mask |= 0b0_1000; // Evaluate
             }
             _ => {}

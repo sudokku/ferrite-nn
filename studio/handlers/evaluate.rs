@@ -25,10 +25,13 @@ pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
     )).unwrap_or_else(|| ("—".into(), "—".into(), "—".into(), "—".into()));
 
     let total_time = match training {
-        TrainingStatus::Done { elapsed_total_ms, .. } =>
-            format!("{:.1}s", *elapsed_total_ms as f64 / 1000.0),
-        TrainingStatus::Stopped { epochs_completed } =>
-            format!("stopped at {} epochs", epochs_completed),
+        TrainingStatus::Done { elapsed_total_ms, was_stopped, .. } => {
+            if *was_stopped {
+                format!("stopped at {} epochs", history.len())
+            } else {
+                format!("{:.1}s", *elapsed_total_ms as f64 / 1000.0)
+            }
+        }
         _ => "—".into(),
     };
 

@@ -27,7 +27,7 @@ train real models — including a digit recognizer that hits ~97% accuracy on MN
 You will need Rust 1.75 or newer.
 
 ```sh
-git clone https://github.com/your-username/ferrite-nn
+git clone https://github.com/sudokku/ferrite-nn
 cd ferrite-nn
 ```
 

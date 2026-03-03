@@ -34,30 +34,26 @@ src/
     epoch_stats.rs         — EpochStats struct (Serialize/Deserialize)
     train_config.rs        — TrainConfig: epochs, batch_size, loss_type, progress_tx, stop_flag
     loop_fn.rs             — train_loop(): full training loop with SSE channel + stop flag
-studio/
-  main.rs                  — HTTP server entry; SharedState; request dispatch loop
+crates/ferrite-studio/src/
+  main.rs                  — tokio::main; builds axum Router; binds 127.0.0.1:7878
   state.rs                 — StudioState, TrainingStatus, DatasetState, Hyperparams, FlashMessage
-  render.rs                — render_page(Page, tab_unlock, training_running, fill_closure) -> String
-  routes.rs                — dispatch() takes &mut Request; match on (method, path)
+  routes.rs                — SharedState type alias; build_router() with all /api/ routes
   handlers/
     mod.rs                 — declares all handler modules
-    architect.rs           — GET/POST /architect, /architect/save
-    dataset.rs             — GET/POST /dataset, /dataset/upload, /dataset/upload-idx, /dataset/builtin
-    train.rs               — GET/POST /train, /train/start, /train/stop
-    train_sse.rs           — GET /train/events (SSE; takes Request by value for streaming)
-    evaluate.rs            — GET /evaluate, /evaluate/export
-    test.rs                — GET/POST /test, /test/infer
-    models.rs              — GET /models/{name}/download
+    architect.rs           — GET/POST /api/architect, /api/architect/save (JSON)
+    dataset.rs             — GET/POST /api/dataset, /api/dataset/upload, /api/dataset/upload-idx, /api/dataset/builtin
+    train.rs               — GET/POST /api/train, /api/train/start, /api/train/stop
+    train_sse.rs           — GET /api/train/events (axum Sse<BoxStream<...>>)
+    evaluate.rs            — GET /api/evaluate, /api/evaluate/export
+    test.rs                — GET/POST /api/test, /api/test/infer, /api/test/import-model
+    models.rs              — GET /api/models, /api/models/:name/download
   util/
-    mod.rs                 — declares all util modules
-    form.rs                — url_decode, parse_form, form_get
-    multipart.rs           — extract_boundary, multipart_extract_file, multipart_extract_file_by_name, extract_text_field, extract_all_text_fields
+    mod.rs                 — declares: csv, idx, image (form/multipart/sse deleted)
     csv.rs                 — parse_csv (LabelMode: ClassIndex/OneHot), builtin_xor/circles/blobs
-    idx.rs                 — parse_idx_pair(&image_bytes, &label_bytes, n_classes) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), String>
-    sse.rs                 — SSE helpers (mostly unused; train_sse writes raw HTTP)
+    idx.rs                 — parse_idx_pair(&image_bytes, &label_bytes, n_classes) -> Result<...>
     image.rs               — image_bytes_to_grayscale_input, image_bytes_to_rgb_input
   assets/
-    studio.html            — Single-page 5-tab studio (embedded via include_str!)
+    studio.html            — Dead weight (SSR removed; React SPA replaces it in Phase 2)
 examples/
   xor.rs                   — XOR demo; use batch_size=1 for online SGD
   mnist.rs                 — MNIST classifier; saves to trained_models/mnist.json
@@ -101,44 +97,64 @@ trained_models/            — Project-root model storage (NOT examples/trained_
 
 ## Studio Architecture
 
-- `SharedState = Arc<Mutex<StudioState>>` — locked only at the start/end of handlers, never during I/O.
-- SSE handler clones the `Arc<Mutex<Receiver<EpochStats>>>` out before its receive loop.
-- Tab unlock bitmask: bit 0=Architect (always), 1=Dataset (spec saved), 2=Train (dataset loaded), 3=Evaluate (done/stopped), 4=Test (always).
-- POST-Redirect-GET pattern for all form submissions.
-- Trained models saved to `trained_models/<name>.json` (project root).
-- `studio.html` uses `{{PLACEHOLDER}}` tokens; `render.rs` blanks any unfilled ones.
+- `SharedState = Arc<Mutex<StudioState>>` defined in `routes.rs` — locked only at the start/end of handlers, never during I/O or `.await`.
+- All endpoints under `/api/` prefix, return JSON (no HTML).
+- Tab unlock bitmask: bit 0=Architect (always), 1=Dataset (spec saved), 2=Train (dataset loaded), 3=Evaluate (done), 4=Test (always).
+- No POST-Redirect-GET: handlers return JSON directly.
+- Trained models saved to `trained_models/<name>.json` (project root, relative to CWD).
+- `render.rs` deleted; `studio.html` is dead weight (React SPA replaces it in Phase 2).
 
 ## TrainingStatus enum (state.rs)
 
-- `Stopped` variant **removed**. Stopping training now produces `Done { was_stopped: true, .. }`.
-- `Done` fields: `model_path: String`, `elapsed_total_ms: u64`, `was_stopped: bool`.
-- Model is always saved after training loop, regardless of whether the user clicked Stop.
-- `tab_unlock_mask()` only matches `Done { .. }` (Stopped was removed).
-- All handlers that previously matched `Stopped` must now check `Done { was_stopped, .. }`.
+- Variants: `Idle`, `Running { stop_flag, epoch_rx, total_epochs }`, `Done { model_path, elapsed_total_ms, was_stopped }`, `Failed { reason }`.
+- `Running.epoch_rx` is `Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<EpochStats>>>` (NOT std).
+- Stopping training produces `Done { was_stopped: true, .. }` — model is always saved.
 - SSE: emits `event: stopped` (with `model_path`) when `was_stopped=true`, `event: done` otherwise.
 - XOR built-in dataset forces `val_split=0` (4 samples — validation split is misleading).
-- Test tab has `POST /test/import-model` route; uses `find_subsequence`/`split_on` from multipart util.
-- Train done card: `build_done_stats` adds `id="done-stats-js"` and "Saved to:" path line.
-- studio.html: `restoreTrainDone()` repopulates done card from `sessionStorage` on client tab switch.
 
 ## Dependencies
 
-- `rand = "0.8.5"`, `serde/serde_json = "1"`, `tiny_http = "0.12"`, `image = "0.24"` (all in `[dependencies]`).
+### ferrite-nn (library crate)
+- `rand = "0.8.5"`, `serde/serde_json = "1"`, `image = "0.24"` (all in `[dependencies]`).
 - No `[dev-dependencies]` section.
-- `tiny_http::Request::into_writer()` returns `Box<dyn Write + Send>` directly (not Result).
+
+### ferrite-studio (binary crate)
+- `axum = "0.7"` (NOT 0.8 — axum 0.8 requires rustc 1.78, axum 0.7 MSRV is 1.66).
+- `tower-http = "0.5"` (MSRV 1.66, matching axum 0.7).
+- `tokio = "1"` with `features = ["full"]`.
+- `futures = "0.3"` for stream combinators in SSE handler.
+- `image = "0.24"` with `default-features = false, features = ["png","jpeg","bmp","gif"]`.
+- axum 0.7 uses `:name` path param syntax; axum 0.8 uses `{name}` — use `:name` for compatibility.
 
 ## Dataset: IDX Format Support
 
-- `studio/util/idx.rs`: `parse_idx_pair` validates IDX3 image + IDX1 label files and returns `(inputs, labels)` compatible with `build_dataset_state`.
-- `multipart_extract_file_by_name(body, boundary, field_name)` added to multipart.rs: picks a file part by its form `name=` attribute (needed when a form has multiple file inputs).
+- `crates/ferrite-studio/src/util/idx.rs`: `parse_idx_pair` validates IDX3 image + IDX1 label files and returns `(inputs, labels)` compatible with `build_dataset_state`.
+- IDX files uploaded via `POST /api/dataset/upload-idx` multipart with fields `images_file` and `labels_file` — handled by axum `Multipart` extractor.
 - `MAX_IDX_BYTES = 100 MB` (MNIST train ~47 MB; allow headroom).
-- Dataset tab has three toggle panels: "upload" (CSV), "idx" (IDX/MNIST), "builtin". Template placeholders: `{{DS_IDX_ACTIVE}}`, `{{DS_IDX_HIDE}}`.
-- `build_dataset_page` active_panel values: `"upload"`, `"idx"`, `"builtin"`.
-- IDX handler derives `source_name` as `"IDX upload (N samples, S×S px, C classes)"` using `sqrt(n_pixels)` for a best-effort square dimension.
+- IDX handler derives `source_name` as `"IDX upload (N samples, SxS px, C classes)"` using `sqrt(n_pixels)` for a best-effort square dimension.
+
+## Studio Architecture (Phase 1: axum REST API)
+
+- `ferrite-studio` is now a JSON REST API served by axum 0.7 on port 7878.
+- All routes prefixed with `/api/` — no HTML is served.
+- `SharedState = Arc<Mutex<StudioState>>` lives in `routes.rs`.
+- axum `State<SharedState>` extractor used in all handlers.
+- `TrainingStatus::Running` uses `tokio::sync::mpsc::Receiver` (NOT `std::sync::mpsc`) so the async SSE handler can recv without blocking.
+- The training background thread uses `std::sync::mpsc::Sender` → relay thread bridges to `tokio::sync::mpsc::Sender` via `blocking_send`.
+- SSE handler (`train_sse.rs`) uses `axum::response::sse::{Sse, Event, KeepAlive}` + `futures::stream::{StreamExt, unfold, iter}`.
+- The two SSE match arms (Running vs. not-Running) use `Box<Pin<...>>` (`SseStream` alias) to unify the concrete stream types.
+- `axum::extract::Multipart` consumes the body; must be the last extractor. When `State<S>` + `Multipart` is used together, the `State` arg must NOT be shadowed or locked in the same expression — keep lock scopes inside the body, dropped before any `.await`.
+- Deleted files: `render.rs`, `util/form.rs`, `util/multipart.rs`, `util/sse.rs`.
+- `util/mod.rs` now only declares: `csv`, `idx`, `image`.
+- `handlers/models.rs` `handle_list` takes NO `State` — reads filesystem directly.
+- Dataset handlers (`handle_upload`, `handle_upload_idx`) return the full `DatasetResponse` JSON on success, not a redirect.
+- `handle_infer` uses `State(_state)` (underscore) because it doesn't currently need state; keep the param for future extension.
 
 ## Known Patterns / Gotchas
 
 - Hex color codes in `format!` strings (e.g. `"#1e40af"`) cause Rust 2021 "unknown prefix" errors. Build SVG via string concatenation with color constants instead.
 - `Network` and `Layer` now derive `Clone` (added to support `evaluate.rs` confusion matrix).
-- The SSE handler writes raw HTTP headers manually (tiny_http `into_writer` bypasses response builder).
-- When draining `mpsc::Receiver` from `Arc<Mutex<Receiver>>` in a struct, collect to a local Vec first to avoid borrow conflicts with other fields.
+- axum 0.7 `Handler<T, S>` blanket impls require the state type `S: Clone`; `Arc<Mutex<T>>` satisfies this.
+- When both `State<S>` and `Multipart` are handler extractors and the handler also locks the state, avoid holding the `MutexGuard` across any `.await` point — the compiler may reject the future as non-`Send`.
+- `tokio::sync::Mutex` (not `std`) is used for the epoch receiver in `TrainingStatus::Running` to allow locking inside an async context.
+- The SSE stream type must be boxed (`Pin<Box<dyn Stream<...>>>`) when different match arms produce structurally different stream types — otherwise the function won't compile due to return type mismatch.

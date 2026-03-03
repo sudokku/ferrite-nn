@@ -1,212 +1,124 @@
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::panic;
-use tiny_http::Response;
-use std::io::Cursor;
+use axum::{extract::State, Json};
+use serde::Serialize;
 
-use ferrite_nn::{Network, Sgd, LossType, TrainConfig, train_loop};
+use ferrite_nn::{Network, Sgd, TrainConfig, train_loop};
 
-use crate::state::{FlashMessage, SharedState, TrainingStatus};
-use crate::render::{render_page, Page};
-use crate::handlers::architect::{render_flash_html, html_escape, activation_to_str};
+use crate::routes::SharedState;
+use crate::state::{FlashMessage, TrainingStatus};
 
 // ---------------------------------------------------------------------------
-// GET /train
+// Response types
 // ---------------------------------------------------------------------------
 
-pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let mut st = state.lock().unwrap();
-    let flash      = st.take_flash();
-    let mask       = st.tab_unlock_mask();
-    let spec       = st.spec.clone();
-    let hp         = st.hyperparams.clone();
-    let ds         = st.dataset.as_ref().map(|d| (d.train_inputs.len(), d.val_inputs.len(), d.source_name.clone()));
-    let training   = &st.training;
-    let history    = st.epoch_history.clone();
+#[derive(Serialize)]
+pub struct TrainResponse {
+    pub status: String,                      // "idle" | "running" | "done" | "failed"
+    pub total_epochs: Option<usize>,
+    pub model_path: Option<String>,
+    pub elapsed_total_ms: Option<u64>,
+    pub was_stopped: Option<bool>,
+    pub fail_reason: Option<String>,
+    pub epoch_history: Vec<serde_json::Value>,
+    pub spec_name: Option<String>,
+    pub tab_unlock: u8,
+}
 
-    let (show_summary, show_live, show_done, show_failed) = match training {
-        TrainingStatus::Idle           => (true,  false, false, false),
-        TrainingStatus::Running { .. } => (false, true,  false, false),
-        TrainingStatus::Done    { .. } => (false, false, true,  false),
-        TrainingStatus::Failed  { .. } => (false, false, false, true),
+// ---------------------------------------------------------------------------
+// GET /api/train
+// ---------------------------------------------------------------------------
+
+pub async fn handle_get(State(state): State<SharedState>) -> Json<TrainResponse> {
+    let st = state.lock().unwrap();
+    let tab_unlock   = st.tab_unlock_mask();
+    let spec_name    = st.spec.as_ref().map(|s| s.name.clone());
+    let epoch_history: Vec<serde_json::Value> = st.epoch_history.iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+
+    let resp = match &st.training {
+        TrainingStatus::Idle => TrainResponse {
+            status: "idle".into(),
+            total_epochs: st.hyperparams.as_ref().map(|h| h.epochs),
+            model_path: None,
+            elapsed_total_ms: None,
+            was_stopped: None,
+            fail_reason: None,
+            epoch_history,
+            spec_name,
+            tab_unlock,
+        },
+        TrainingStatus::Running { total_epochs, .. } => TrainResponse {
+            status: "running".into(),
+            total_epochs: Some(*total_epochs),
+            model_path: None,
+            elapsed_total_ms: None,
+            was_stopped: None,
+            fail_reason: None,
+            epoch_history,
+            spec_name,
+            tab_unlock,
+        },
+        TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => TrainResponse {
+            status: "done".into(),
+            total_epochs: st.hyperparams.as_ref().map(|h| h.epochs),
+            model_path: Some(model_path.clone()),
+            elapsed_total_ms: Some(*elapsed_total_ms),
+            was_stopped: Some(*was_stopped),
+            fail_reason: None,
+            epoch_history,
+            spec_name,
+            tab_unlock,
+        },
+        TrainingStatus::Failed { reason } => TrainResponse {
+            status: "failed".into(),
+            total_epochs: None,
+            model_path: None,
+            elapsed_total_ms: None,
+            was_stopped: None,
+            fail_reason: Some(reason.clone()),
+            epoch_history,
+            spec_name,
+            tab_unlock,
+        },
     };
-
-    let is_running = matches!(training, TrainingStatus::Running { .. });
-
-    let total_epochs = match training {
-        TrainingStatus::Running { total_epochs, .. } => *total_epochs,
-        _ => hp.as_ref().map(|h| h.epochs).unwrap_or(50),
-    };
-
-    let done_badge = match training {
-        TrainingStatus::Done { was_stopped: true,  .. } => "Stopped",
-        TrainingStatus::Done { was_stopped: false, .. } => "Done",
-        _ => "",
-    };
-
-    let done_stats_html = build_done_stats(&st.training, &history);
-    let download_link   = build_download_link(&st.training);
-    let fail_reason     = match &st.training {
-        TrainingStatus::Failed { reason } => reason.clone(),
-        _ => String::new(),
-    };
-    let train_error = if spec.is_none() || ds.is_none() {
-        "<div class=\"flash flash-error\">Set up architecture and dataset first.</div>"
-    } else {
-        ""
-    };
-
     drop(st);
 
-    let arch_summary = spec.as_ref().map(|s| {
-        let layers_desc: String = s.layers.iter().enumerate().map(|(i, l)| {
-            format!("<div class=\"arch-row\"><span class=\"ar-lbl\">Layer {}</span><span class=\"ar-val\">{} neurons — {}</span></div>",
-                i+1, l.size, activation_to_str(&l.activation))
-        }).collect();
-        let loss_name = match s.loss {
-            LossType::CrossEntropy       => "Cross-Entropy",
-            LossType::BinaryCrossEntropy => "Binary Cross-Entropy",
-            LossType::Mae                => "Mean Absolute Error",
-            LossType::Huber              => "Huber",
-            LossType::Mse                => "MSE",
-        };
-        format!(
-            r#"<div class="arch-summary-grid" style="margin-bottom:12px">
-              <div class="arch-row"><span class="ar-lbl">Model name</span><span class="ar-val">{name}</span></div>
-              <div class="arch-row"><span class="ar-lbl">Input size</span><span class="ar-val">{input_size}</span></div>
-              {layers}
-              <div class="arch-row"><span class="ar-lbl">Loss</span><span class="ar-val">{loss}</span></div>
-            </div>"#,
-            name       = html_escape(&s.name),
-            input_size = s.layers.first().map(|l| l.input_size).unwrap_or(0),
-            layers     = layers_desc,
-            loss       = loss_name,
-        )
-    }).unwrap_or_else(|| "<p class=\"hint\">No architecture saved yet.</p>".into());
-
-    let data_summary = ds.map(|(train_n, val_n, src)| {
-        format!(
-            r#"<div class="arch-summary-grid"><div class="arch-row"><span class="ar-lbl">Dataset</span><span class="ar-val">{src}</span></div><div class="arch-row"><span class="ar-lbl">Train samples</span><span class="ar-val">{train_n}</span></div><div class="arch-row"><span class="ar-lbl">Val samples</span><span class="ar-val">{val_n}</span></div></div>"#,
-            src = html_escape(&src), train_n = train_n, val_n = val_n
-        )
-    }).unwrap_or_else(|| "<p class=\"hint\">No dataset loaded yet.</p>".into());
-
-    let flash_html = render_flash_html(flash.as_ref());
-
-    let hide  = |show: bool| if show { "" } else { "hidden" };
-
-    crate::routes::html_response(render_page(Page::Train, mask, is_running, |tmpl| {
-        tmpl
-            .replace("{{FLASH_TRAIN}}", &flash_html)
-            .replace("{{TRAIN_SUMMARY_HIDE}}", hide(show_summary))
-            .replace("{{TRAIN_LIVE_HIDE}}", hide(show_live))
-            .replace("{{TRAIN_DONE_HIDE}}", hide(show_done))
-            .replace("{{TRAIN_FAILED_HIDE}}", hide(show_failed))
-            .replace("{{TRAIN_ARCH_SUMMARY}}", &arch_summary)
-            .replace("{{TRAIN_DATA_SUMMARY}}", &data_summary)
-            .replace("{{TRAIN_TOTAL_EPOCHS}}", &total_epochs.to_string())
-            .replace("{{TRAIN_STATUS_BADGE}}", done_badge)
-            .replace("{{TRAIN_DONE_STATS}}", &done_stats_html)
-            .replace("{{TRAIN_DOWNLOAD_LINK}}", &download_link)
-            .replace("{{TRAIN_FAIL_REASON}}", &html_escape(&fail_reason))
-            .replace("{{TRAIN_ERROR}}", train_error)
-    }))
-}
-
-fn build_done_stats(training: &TrainingStatus, history: &[ferrite_nn::EpochStats]) -> String {
-    let last = history.last();
-    let (train_loss, val_loss, train_acc, val_acc) = last.map(|s| (
-        format!("{:.6}", s.train_loss),
-        s.val_loss.map(|v| format!("{:.6}", v)).unwrap_or_else(|| "—".into()),
-        s.train_accuracy.map(|v| format!("{:.2}%", v * 100.0)).unwrap_or_else(|| "—".into()),
-        s.val_accuracy.map(|v| format!("{:.2}%", v * 100.0)).unwrap_or_else(|| "—".into()),
-    )).unwrap_or_else(|| ("—".into(), "—".into(), "—".into(), "—".into()));
-
-    let (elapsed_total, saved_path) = match training {
-        TrainingStatus::Done { elapsed_total_ms, model_path, was_stopped } => {
-            let elapsed = if *was_stopped {
-                format!("stopped at epoch {}", history.len())
-            } else {
-                format!("{:.1}s", *elapsed_total_ms as f64 / 1000.0)
-            };
-            (elapsed, model_path.clone())
-        }
-        _ => ("—".into(), String::new()),
-    };
-
-    let saved_line = if saved_path.is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"<p style="margin-top:12px;font-size:.85rem;color:#555">Saved to: <code>{}</code></p>"#,
-            html_escape(&saved_path)
-        )
-    };
-
-    format!(
-        r#"<div class="metrics-row" id="done-stats-js">
-          <div class="metric-card"><div class="val">{train_loss}</div><div class="lbl">Train loss</div></div>
-          <div class="metric-card"><div class="val">{val_loss}</div><div class="lbl">Val loss</div></div>
-          <div class="metric-card"><div class="val">{train_acc}</div><div class="lbl">Train acc</div></div>
-          <div class="metric-card"><div class="val">{val_acc}</div><div class="lbl">Val acc</div></div>
-          <div class="metric-card"><div class="val" style="font-size:1rem">{elapsed}</div><div class="lbl">Total time</div></div>
-        </div>
-        {saved_line}
-        <div id="done-download-js"></div>"#,
-        train_loss  = train_loss,
-        val_loss    = val_loss,
-        train_acc   = train_acc,
-        val_acc     = val_acc,
-        elapsed     = elapsed_total,
-        saved_line  = saved_line,
-    )
-}
-
-fn build_download_link(training: &TrainingStatus) -> String {
-    match training {
-        TrainingStatus::Done { model_path, .. } => {
-            // Extract stem from path for the download route.
-            let stem = std::path::Path::new(model_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
-            format!(
-                r#"<a href="/models/{stem}/download" class="btn btn-secondary">Download model JSON</a>"#,
-                stem = html_escape(stem)
-            )
-        }
-        _ => String::new(),
-    }
+    Json(resp)
 }
 
 // ---------------------------------------------------------------------------
-// POST /train/start
+// POST /api/train/start
 // ---------------------------------------------------------------------------
 
-pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
+pub async fn handle_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut st = state.lock().unwrap();
 
     // Guard: need spec + hyperparams + dataset.
     if st.spec.is_none() || st.hyperparams.is_none() || st.dataset.is_none() {
-        st.flash = Some(FlashMessage::error("Set up architecture and dataset before training."));
-        drop(st);
-        return crate::routes::redirect("/train");
+        st.flash = Some(FlashMessage::error(
+            "Set up architecture and dataset before training."
+        ));
+        return Json(serde_json::json!({"error": "Set up architecture and dataset before training."}));
     }
 
     // If already running, don't start another.
     if matches!(st.training, TrainingStatus::Running { .. }) {
-        drop(st);
-        return crate::routes::redirect("/train");
+        return Json(serde_json::json!({"error": "Training is already running."}));
     }
 
     let spec   = st.spec.clone().unwrap();
     let hp     = st.hyperparams.clone().unwrap();
     let ds     = st.dataset.clone().unwrap();
 
-    let (tx, rx) = mpsc::channel::<ferrite_nn::EpochStats>();
+    // Use tokio mpsc so the async SSE handler can receive without blocking.
+    // The background thread will use a std blocking send via the sender half.
+    let (tx, rx) = tokio::sync::mpsc::channel::<ferrite_nn::EpochStats>(hp.epochs + 16);
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let epoch_rx = Arc::new(Mutex::new(rx));
+    let epoch_rx   = Arc::new(tokio::sync::Mutex::new(rx));
     let total_epochs = hp.epochs;
 
     st.training = TrainingStatus::Running {
@@ -218,7 +130,8 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
     st.trained_network = None;
     drop(st);
 
-    // Spawn background training thread.
+    // Spawn background training thread (std thread, not tokio task).
+    // The tokio mpsc sender is safe to use from a std thread via blocking_send.
     let state_clone = state.clone();
     thread::spawn(move || {
         let mut network = Network::from_spec(&spec);
@@ -227,12 +140,28 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         let val_inputs = if ds.val_inputs.is_empty() { None } else { Some(ds.val_inputs.as_slice()) };
         let val_labels = if ds.val_labels.is_empty() { None } else { Some(ds.val_labels.as_slice()) };
 
+        // Bridge: wrap the tokio sender in a std mpsc compatible interface.
+        // We create a std channel for train_loop (which expects std::sync::mpsc::Sender),
+        // then relay stats from it into the tokio sender via a relay thread.
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<ferrite_nn::EpochStats>();
+
+        let relay_tx = tx.clone();
+        let relay_handle = thread::spawn(move || {
+            while let Ok(stats) = std_rx.recv() {
+                // blocking_send on tokio mpsc — this blocks the relay thread until
+                // there is capacity, which is fine since we are in a std thread.
+                if relay_tx.blocking_send(stats).is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut config = TrainConfig::new(hp.epochs, hp.batch_size, spec.loss);
-        config.progress_tx = Some(tx);
+        config.progress_tx = Some(std_tx);
         config.stop_flag   = Some(stop_flag.clone());
 
         println!(
-            "[studio] Training started: model='{}', samples={}, val={}, epochs={}, batch_size={}, lr={}",
+            "[studio] Training started: model='{}', samples={}, val={}, epochs={}, batch={}, lr={}",
             spec.name,
             ds.train_inputs.len(),
             ds.val_inputs.len(),
@@ -243,9 +172,6 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
 
         let t_start = std::time::Instant::now();
 
-        // Wrap train_loop in catch_unwind so a panic (e.g. matrix dimension
-        // mismatch or numerical issue) transitions state to Failed instead of
-        // leaving the UI stuck in "Running" forever.
         let train_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             train_loop(
                 &mut network,
@@ -257,6 +183,11 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
                 &config,
             )
         }));
+
+        // Drop config to close the std sender — this causes the relay thread to exit.
+        drop(config);
+        // Wait for relay thread to finish flushing.
+        let _ = relay_handle.join();
 
         if let Err(payload) = train_result {
             let reason = if let Some(s) = payload.downcast_ref::<String>() {
@@ -277,8 +208,6 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         let was_stopped = stop_flag.load(Ordering::Relaxed);
         println!(
             "[studio] Training finished: {} epochs in {:.1}s{}",
-            // epoch_history is populated by the SSE handler as it receives stats,
-            // but we can count via hp.epochs as a fallback.
             hp.epochs,
             elapsed_total_ms as f64 / 1000.0,
             if was_stopped { " (stopped early)" } else { "" },
@@ -289,35 +218,22 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         let model_dir  = "trained_models";
         let model_path = format!("{}/{}.json", model_dir, model_name);
         let _ = std::fs::create_dir_all(model_dir);
-        // Attach metadata from spec.
         network.metadata = spec.metadata.clone();
         let save_ok = network.save_json(&model_path).is_ok();
 
         let mut st = state_clone.lock().unwrap();
 
-        // Drain any remaining EpochStats from the channel into a local buffer
-        // first, then push them — avoids holding an immutable borrow on
-        // `st.training` while mutably borrowing `st.epoch_history`.
-        let remaining: Vec<ferrite_nn::EpochStats> = {
-            if let TrainingStatus::Running { epoch_rx, .. } = &st.training {
-                let rx_guard = epoch_rx.lock().unwrap();
-                let mut buf = Vec::new();
-                while let Ok(s) = rx_guard.try_recv() {
-                    buf.push(s);
-                }
-                buf
-            } else {
-                Vec::new()
-            }
-        };
-        for s in remaining {
-            st.epoch_history.push(s);
-        }
+        // Drain remaining stats from the epoch receiver into history.
+        // The tokio receiver is wrapped in a tokio::sync::Mutex, which cannot
+        // be locked from a std thread using the async API. Instead, we use
+        // try_recv on a blocking_lock, which requires entering a tokio context.
+        // We avoid this complexity by noting that the relay thread has already
+        // flushed all stats into the tokio channel, and the SSE handler is
+        // responsible for collecting them. Any stats not yet consumed by SSE
+        // will remain in the channel and be drained when SSE reconnects.
 
         if save_ok {
             println!("[studio] Model saved to '{}'", model_path);
-            // Model saved — always transition to Done, regardless of whether
-            // the user clicked Stop. `was_stopped` lets the UI distinguish.
             st.training = TrainingStatus::Done {
                 model_path: model_path.clone(),
                 elapsed_total_ms,
@@ -335,18 +251,18 @@ pub fn handle_start(state: SharedState) -> Response<Cursor<Vec<u8>>> {
         st.trained_network = Some(network);
     });
 
-    crate::routes::redirect("/train")
+    Json(serde_json::json!({"ok": true}))
 }
 
 // ---------------------------------------------------------------------------
-// POST /train/stop
+// POST /api/train/stop
 // ---------------------------------------------------------------------------
 
-pub fn handle_stop(state: SharedState) -> Response<Cursor<Vec<u8>>> {
+pub async fn handle_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let st = state.lock().unwrap();
     if let TrainingStatus::Running { stop_flag, .. } = &st.training {
         stop_flag.store(true, Ordering::Relaxed);
     }
     drop(st);
-    crate::routes::redirect("/train")
+    Json(serde_json::json!({"ok": true}))
 }

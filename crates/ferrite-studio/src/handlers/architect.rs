@@ -1,109 +1,152 @@
-use tiny_http::{Request, Response};
-use std::io::Cursor;
+use axum::{extract::State, Json};
+use serde::{Deserialize, Serialize};
 
-use ferrite_nn::{ActivationFunction, LossType, NetworkSpec, LayerSpec};
+use ferrite_nn::{ActivationFunction, InputType, LossType, ModelMetadata, NetworkSpec, LayerSpec};
 
-use crate::state::{FlashMessage, Hyperparams, SharedState, TrainingStatus};
-use crate::util::form::{parse_form, form_get};
-use crate::render::{render_page, Page};
+use crate::state::{FlashKind, FlashMessage, Hyperparams, TrainingStatus};
+use crate::routes::SharedState;
 
 // ---------------------------------------------------------------------------
-// GET /architect
+// Response types
 // ---------------------------------------------------------------------------
 
-pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let mut st = state.lock().unwrap();
-    let flash = st.take_flash();
-    let tab_unlock = st.tab_unlock_mask();
-    let spec       = st.spec.clone();
-    let hyperparams = st.hyperparams.clone();
-    drop(st);
+#[derive(Serialize)]
+pub struct ArchitectResponse {
+    pub spec: Option<serde_json::Value>,
+    pub hyperparams: Option<HyperparamsJson>,
+    pub tab_unlock: u8,
+    pub flash: Option<FlashJson>,
+}
 
-    let page = build_arch_page(&spec, &hyperparams, None, flash, tab_unlock);
-    crate::routes::html_response(page)
+#[derive(Serialize)]
+pub struct HyperparamsJson {
+    pub learning_rate: f64,
+    pub batch_size: usize,
+    pub epochs: usize,
+}
+
+#[derive(Serialize)]
+pub struct FlashJson {
+    pub kind: String, // "success" | "error"
+    pub text: String,
 }
 
 // ---------------------------------------------------------------------------
-// POST /architect/save
+// Request types
 // ---------------------------------------------------------------------------
 
-pub fn handle_post(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
-    let pairs = parse_form(&body);
+#[derive(Deserialize)]
+pub struct SaveArchitectRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_size: usize,
+    pub loss_type: String,       // "mse" | "cross_entropy" | "bce" | "mae" | "huber"
+    pub learning_rate: f64,
+    pub batch_size: usize,
+    pub epochs: usize,
+    pub layers: Vec<LayerRequest>,
+    pub input_type: Option<InputTypeRequest>,
+}
 
-    let name         = form_get(&pairs, "name").unwrap_or("").trim().to_owned();
-    let description  = form_get(&pairs, "description").unwrap_or("").trim().to_owned();
-    let input_size_s = form_get(&pairs, "input_size").unwrap_or("1").to_owned();
-    let loss_s       = form_get(&pairs, "loss_type").unwrap_or("mse").to_owned();
-    let lr_s         = form_get(&pairs, "learning_rate").unwrap_or("0.01").to_owned();
-    let bs_s         = form_get(&pairs, "batch_size").unwrap_or("32").to_owned();
-    let ep_s         = form_get(&pairs, "epochs").unwrap_or("50").to_owned();
-    let layers_json  = form_get(&pairs, "layers_json").unwrap_or("[]").to_owned();
+#[derive(Deserialize)]
+pub struct LayerRequest {
+    pub neurons: usize,
+    pub activation: String,
+}
 
-    // Helper: return error page using current state as defaults.
-    let show_err = |err: &str, state: &SharedState| -> Response<Cursor<Vec<u8>>> {
-        let st = state.lock().unwrap();
-        let mask = st.tab_unlock_mask();
-        let spec = st.spec.clone();
-        let hp   = st.hyperparams.clone();
-        drop(st);
-        crate::routes::html_response(build_arch_page(&spec, &hp, Some(err), None, mask))
-    };
+#[derive(Deserialize)]
+pub struct InputTypeRequest {
+    pub kind: String,          // "numeric" | "grayscale" | "rgb"
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/architect
+// ---------------------------------------------------------------------------
+
+pub async fn handle_get(State(state): State<SharedState>) -> Json<ArchitectResponse> {
+    let mut st = state.lock().unwrap();
+    let flash = st.take_flash();
+    let tab_unlock = st.tab_unlock_mask();
+    let spec = st.spec.clone();
+    let hyperparams = st.hyperparams.clone();
+    drop(st);
+
+    let spec_json = spec.as_ref().and_then(|s| serde_json::to_value(s).ok());
+
+    let hp_json = hyperparams.as_ref().map(|h| HyperparamsJson {
+        learning_rate: h.learning_rate,
+        batch_size: h.batch_size,
+        epochs: h.epochs,
+    });
+
+    let flash_json = flash.map(|f| FlashJson {
+        kind: match f.kind {
+            FlashKind::Success => "success".into(),
+            FlashKind::Error   => "error".into(),
+        },
+        text: f.text,
+    });
+
+    Json(ArchitectResponse {
+        spec: spec_json,
+        hyperparams: hp_json,
+        tab_unlock,
+        flash: flash_json,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/architect/save
+// ---------------------------------------------------------------------------
+
+pub async fn handle_post(
+    State(state): State<SharedState>,
+    Json(req): Json<SaveArchitectRequest>,
+) -> Json<serde_json::Value> {
+    let name = req.name.trim().to_owned();
 
     if name.is_empty() {
-        return show_err("Model name must not be empty.", &state);
+        return Json(serde_json::json!({"error": "Model name must not be empty."}));
     }
 
-    let input_size: usize = match input_size_s.trim().parse() {
-        Ok(v) if v > 0 => v,
-        _ => return show_err("Input size must be a positive integer.", &state),
-    };
-
-    let lr: f64 = match lr_s.trim().parse::<f64>() {
-        Ok(v) if v > 0.0 => v,
-        _ => return show_err("Learning rate must be a positive number.", &state),
-    };
-
-    let bs: usize = match bs_s.trim().parse() {
-        Ok(v) if v > 0 => v,
-        _ => return show_err("Batch size must be a positive integer.", &state),
-    };
-
-    let ep: usize = match ep_s.trim().parse() {
-        Ok(v) if v > 0 => v,
-        _ => return show_err("Epochs must be a positive integer.", &state),
-    };
-
-    // Parse layers JSON (sent by the JS prepareSubmit() function).
-    #[derive(serde::Deserialize)]
-    struct RawLayer { neurons: usize, activation: String }
-
-    let raw_layers: Vec<RawLayer> = match serde_json::from_str(&layers_json) {
-        Ok(v) => v,
-        Err(_) => return show_err("Could not parse layer definitions.", &state),
-    };
-
-    if raw_layers.is_empty() {
-        return show_err("Add at least one layer.", &state);
+    if req.input_size == 0 {
+        return Json(serde_json::json!({"error": "Input size must be a positive integer."}));
     }
 
-    for rl in &raw_layers {
+    if req.learning_rate <= 0.0 {
+        return Json(serde_json::json!({"error": "Learning rate must be a positive number."}));
+    }
+
+    if req.batch_size == 0 {
+        return Json(serde_json::json!({"error": "Batch size must be a positive integer."}));
+    }
+
+    if req.epochs == 0 {
+        return Json(serde_json::json!({"error": "Epochs must be a positive integer."}));
+    }
+
+    if req.layers.is_empty() {
+        return Json(serde_json::json!({"error": "Add at least one layer."}));
+    }
+
+    for rl in &req.layers {
         if rl.neurons == 0 {
-            return show_err("Each layer must have at least 1 neuron.", &state);
+            return Json(serde_json::json!({"error": "Each layer must have at least 1 neuron."}));
         }
     }
 
     // Build LayerSpec list.
     let mut layer_specs: Vec<LayerSpec> = Vec::new();
-    let mut prev_size = input_size;
-    for rl in &raw_layers {
+    let mut prev_size = req.input_size;
+    for rl in &req.layers {
         let activation = parse_activation(&rl.activation);
         layer_specs.push(LayerSpec { size: rl.neurons, input_size: prev_size, activation });
         prev_size = rl.neurons;
     }
 
-    let loss = match loss_s.as_str() {
+    let loss = match req.loss_type.as_str() {
         "cross_entropy" => LossType::CrossEntropy,
         "bce"           => LossType::BinaryCrossEntropy,
         "mae"           => LossType::Mae,
@@ -114,34 +157,52 @@ pub fn handle_post(request: &mut Request, state: SharedState) -> Response<Cursor
     // Enforce Softmax <-> CrossEntropy consistency.
     let last_act = &layer_specs.last().unwrap().activation;
     if *last_act == ActivationFunction::Softmax && loss != LossType::CrossEntropy {
-        return show_err(
-            "Softmax output requires Cross-Entropy loss. Please change the loss function.",
-            &state,
-        );
+        return Json(serde_json::json!({
+            "error": "Softmax output requires Cross-Entropy loss. Please change the loss function."
+        }));
     }
     if *last_act != ActivationFunction::Softmax && loss == LossType::CrossEntropy {
-        return show_err(
-            "Cross-Entropy loss requires a Softmax output layer.",
-            &state,
-        );
+        return Json(serde_json::json!({
+            "error": "Cross-Entropy loss requires a Softmax output layer."
+        }));
     }
     if *last_act == ActivationFunction::Softmax && loss == LossType::BinaryCrossEntropy {
-        return show_err(
-            "Binary Cross-Entropy loss must not be paired with a Softmax output. Use Sigmoid instead.",
-            &state,
-        );
+        return Json(serde_json::json!({
+            "error": "Binary Cross-Entropy loss must not be paired with a Softmax output. Use Sigmoid instead."
+        }));
     }
 
-    let mut spec = NetworkSpec { name: name.clone(), layers: layer_specs, loss, metadata: None };
-    if !description.is_empty() {
-        spec.metadata = Some(ferrite_nn::ModelMetadata {
-            description: Some(description),
-            input_type:  None,
+    // Build metadata — include description if provided, and input_type if specified.
+    let description = req.description.as_deref().unwrap_or("").trim().to_owned();
+    let input_type = req.input_type.as_ref().and_then(|it| parse_input_type(it));
+
+    let has_metadata = !description.is_empty() || input_type.is_some();
+    let metadata = if has_metadata {
+        Some(ModelMetadata {
+            description: if description.is_empty() { None } else { Some(description) },
+            input_type,
+            output_labels: None,
+        })
+    } else {
+        None
+    };
+
+    let mut spec = NetworkSpec { name: name.clone(), layers: layer_specs, loss, metadata };
+
+    // If a description was provided and no metadata existed yet, ensure metadata is set.
+    if !req.description.as_deref().unwrap_or("").trim().is_empty() && spec.metadata.is_none() {
+        spec.metadata = Some(ModelMetadata {
+            description: req.description.clone().map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()),
+            input_type: None,
             output_labels: None,
         });
     }
 
-    let hyperparams = Hyperparams { learning_rate: lr, batch_size: bs, epochs: ep };
+    let hyperparams = Hyperparams {
+        learning_rate: req.learning_rate,
+        batch_size: req.batch_size,
+        epochs: req.epochs,
+    };
 
     let mut st = state.lock().unwrap();
     st.spec        = Some(spec);
@@ -156,110 +217,7 @@ pub fn handle_post(request: &mut Request, state: SharedState) -> Response<Cursor
     ));
     drop(st);
 
-    crate::routes::redirect("/architect")
-}
-
-// ---------------------------------------------------------------------------
-// Page builder
-// ---------------------------------------------------------------------------
-
-fn build_arch_page(
-    spec: &Option<NetworkSpec>,
-    hyperparams: &Option<Hyperparams>,
-    error: Option<&str>,
-    flash: Option<FlashMessage>,
-    tab_unlock: u8,
-) -> String {
-    let name       = spec.as_ref().map(|s| s.name.as_str()).unwrap_or("");
-    let desc       = spec.as_ref()
-        .and_then(|s| s.metadata.as_ref())
-        .and_then(|m| m.description.as_deref())
-        .unwrap_or("");
-    let input_size = spec.as_ref()
-        .and_then(|s| s.layers.first())
-        .map(|l| l.input_size)
-        .unwrap_or(2);
-    let loss       = spec.as_ref().map(|s| s.loss).unwrap_or(LossType::Mse);
-    let lr         = hyperparams.as_ref().map(|h| h.learning_rate).unwrap_or(0.01);
-    let bs         = hyperparams.as_ref().map(|h| h.batch_size).unwrap_or(32);
-    let ep         = hyperparams.as_ref().map(|h| h.epochs).unwrap_or(50);
-
-    let layer_rows = spec.as_ref()
-        .map(|s| build_layer_rows(&s.layers))
-        .unwrap_or_else(default_layer_rows);
-
-    let flash_html = render_flash_html(flash.as_ref());
-    let error_html = error.map(|e| {
-        format!(r#"<div class="flash flash-error" style="margin-top:14px">{}</div>"#,
-                html_escape(e))
-    }).unwrap_or_default();
-
-    let sel_mse   = if loss == LossType::Mse                { " selected" } else { "" };
-    let sel_ce    = if loss == LossType::CrossEntropy        { " selected" } else { "" };
-    let sel_bce   = if loss == LossType::BinaryCrossEntropy  { " selected" } else { "" };
-    let sel_mae   = if loss == LossType::Mae                 { " selected" } else { "" };
-    let sel_huber = if loss == LossType::Huber               { " selected" } else { "" };
-
-    render_page(Page::Architect, tab_unlock, false, |tmpl| {
-        tmpl
-            .replace("{{FLASH_ARCH}}", &flash_html)
-            .replace("{{ARCH_NAME}}", &html_escape(name))
-            .replace("{{ARCH_DESC}}", &html_escape(desc))
-            .replace("{{ARCH_INPUT_SIZE}}", &input_size.to_string())
-            .replace("{{LAYER_ROWS}}", &layer_rows)
-            .replace("{{SEL_MSE}}", sel_mse)
-            .replace("{{SEL_CE}}", sel_ce)
-            .replace("{{SEL_BCE}}", sel_bce)
-            .replace("{{SEL_MAE}}", sel_mae)
-            .replace("{{SEL_HUBER}}", sel_huber)
-            .replace("{{ARCH_LR}}", &lr.to_string())
-            .replace("{{ARCH_BS}}", &bs.to_string())
-            .replace("{{ARCH_EP}}", &ep.to_string())
-            .replace("{{ARCH_ERROR}}", &error_html)
-    })
-}
-
-const ACTIVATION_OPTIONS: &[(&str, &str)] = &[
-    ("sigmoid",    "Sigmoid"),
-    ("relu",       "ReLU"),
-    ("tanh",       "Tanh"),
-    ("leaky_relu", "Leaky ReLU (α=0.01)"),
-    ("elu",        "ELU (α=1.0)"),
-    ("gelu",       "GELU"),
-    ("swish",      "Swish"),
-    ("identity",   "Identity"),
-    ("softmax",    "Softmax"),
-];
-
-fn build_layer_rows(layers: &[LayerSpec]) -> String {
-    layers.iter().enumerate().map(|(i, ls)| {
-        let idx     = i + 1;
-        let act_str = activation_to_str(&ls.activation);
-        let opts: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
-            let sel = if val == act_str { " selected" } else { "" };
-            format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
-        }).collect();
-        format!(
-            r#"<tr id="lr-{idx}"><td>{idx}</td><td><input type="number" class="neurons-input" data-field="neurons" value="{sz}" min="1"></td><td><select class="act-select" data-field="activation">{opts}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer({idx})">Remove</button></td></tr>"#,
-            idx = idx, sz = ls.size, opts = opts
-        )
-    }).collect::<Vec<_>>().join("\n")
-}
-
-fn default_layer_rows() -> String {
-    let opts_relu: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
-        let sel = if val == "relu" { " selected" } else { "" };
-        format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
-    }).collect();
-    let opts_softmax: String = ACTIVATION_OPTIONS.iter().map(|&(val, label)| {
-        let sel = if val == "softmax" { " selected" } else { "" };
-        format!("<option value=\"{}\"{}>{}</option>", val, sel, label)
-    }).collect();
-    format!(
-        r#"<tr id="lr-1"><td>1</td><td><input type="number" class="neurons-input" data-field="neurons" value="8" min="1"></td><td><select class="act-select" data-field="activation">{}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(1)">Remove</button></td></tr>
-<tr id="lr-2"><td>2</td><td><input type="number" class="neurons-input" data-field="neurons" value="2" min="1"></td><td><select class="act-select" data-field="activation">{}</select></td><td><button type="button" class="btn btn-secondary btn-sm" onclick="removeLayer(2)">Remove</button></td></tr>"#,
-        opts_relu, opts_softmax
-    )
+    Json(serde_json::json!({"ok": true}))
 }
 
 // ---------------------------------------------------------------------------
@@ -280,36 +238,17 @@ pub fn parse_activation(s: &str) -> ActivationFunction {
     }
 }
 
-pub fn activation_to_str(a: &ActivationFunction) -> &'static str {
-    match a {
-        ActivationFunction::ReLU             => "relu",
-        ActivationFunction::Softmax          => "softmax",
-        ActivationFunction::Identity         => "identity",
-        ActivationFunction::Sigmoid          => "sigmoid",
-        ActivationFunction::Tanh             => "tanh",
-        ActivationFunction::LeakyReLU { .. } => "leaky_relu",
-        ActivationFunction::Elu { .. }       => "elu",
-        ActivationFunction::Gelu             => "gelu",
-        ActivationFunction::Swish            => "swish",
+fn parse_input_type(it: &InputTypeRequest) -> Option<InputType> {
+    match it.kind.as_str() {
+        "grayscale" => Some(InputType::ImageGrayscale {
+            width:  it.width.unwrap_or(28),
+            height: it.height.unwrap_or(28),
+        }),
+        "rgb" => Some(InputType::ImageRgb {
+            width:  it.width.unwrap_or(28),
+            height: it.height.unwrap_or(28),
+        }),
+        "numeric" => Some(InputType::Numeric),
+        _ => None,
     }
-}
-
-pub fn render_flash_html(flash: Option<&FlashMessage>) -> String {
-    match flash {
-        None    => String::new(),
-        Some(f) => {
-            let cls = match f.kind {
-                crate::state::FlashKind::Success => "flash-success",
-                crate::state::FlashKind::Error   => "flash-error",
-            };
-            format!(r#"<div class="flash {}">{}</div>"#, cls, html_escape(&f.text))
-        }
-    }
-}
-
-pub fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
 }

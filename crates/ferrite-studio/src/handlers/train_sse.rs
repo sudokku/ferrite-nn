@@ -1,38 +1,38 @@
-use std::io::Write;
+use std::convert::Infallible;
 use std::time::Duration;
-use tiny_http::Request;
 
-use crate::state::{SharedState, TrainingStatus};
+use axum::{
+    extract::State,
+    response::sse::{Event, KeepAlive, Sse},
+};
+use futures::stream::{self, Stream, StreamExt};
 
-/// `GET /train/events` — Server-Sent Events handler.
+use crate::routes::SharedState;
+use crate::state::TrainingStatus;
+
+/// Type alias to avoid repeating the boxed stream signature everywhere.
+type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+
+/// `GET /api/train/events` — Server-Sent Events endpoint.
 ///
-/// This handler consumes `request` (takes ownership so we can call
-/// `into_writer`) and drives a long-lived loop that:
-/// 1. Tries to receive an `EpochStats` from the training channel with a
-///    500 ms timeout.
-/// 2. On success — serializes the stats and writes an `event: epoch\n\n` frame.
-/// 3. On timeout — writes a keep-alive `: ping\n\n` comment.
-/// 4. On channel disconnect (training finished) — writes a `done` or `stopped`
-///    event, then closes.
+/// Streams epoch stats as SSE events. The event format is preserved exactly:
 ///
-/// Client reconnection is handled natively by `EventSource`.
-pub fn handle(request: Request, state: SharedState) {
-    // tiny_http's `into_writer()` gives us the raw TCP stream so we can
-    // write the HTTP response and then stream SSE frames directly.
-    let mut writer = request.into_writer();
-
-    // Write HTTP response headers manually (tiny_http into_writer path).
-    let header = "HTTP/1.1 200 OK\r\n\
-                  Content-Type: text/event-stream\r\n\
-                  Cache-Control: no-cache\r\n\
-                  Connection: keep-alive\r\n\
-                  X-Accel-Buffering: no\r\n\
-                  \r\n";
-    if let Err(_) = write_all(&mut writer, header.as_bytes()) {
-        return;
-    }
-
-    // Extract the receiver Arc from state (clone it out so we don't hold the lock).
+/// ```
+/// event: epoch
+/// data: {"epoch":1,"total_epochs":50,"train_loss":0.5,...}
+///
+/// event: done
+/// data: {"model_path":"trained_models/my_model.json","elapsed_total_ms":12345,"epochs_completed":50}
+///
+/// event: stopped
+/// data: {"model_path":"...","elapsed_total_ms":3000,"epoch_reached":10,"total_epochs":50}
+///
+/// event: failed
+/// data: {"reason":"..."}
+/// ```
+pub async fn handle(State(state): State<SharedState>) -> Sse<SseStream> {
+    // Clone the epoch receiver arc out of state before building the stream,
+    // so we do not hold the lock during the async stream.
     let epoch_rx = {
         let st = state.lock().unwrap();
         match &st.training {
@@ -41,129 +41,156 @@ pub fn handle(request: Request, state: SharedState) {
         }
     };
 
-    let rx_arc = match epoch_rx {
-        Some(r) => r,
-        None    => {
-            // Training is not Running — emit an event matching the actual state.
-            let msg = {
+    // Replay any epoch stats already accumulated (handles SSE client reconnects).
+    let history_events: Vec<Result<Event, Infallible>> = {
+        let st = state.lock().unwrap();
+        st.epoch_history.iter()
+            .filter_map(|stats| {
+                serde_json::to_string(stats).ok().map(|json| {
+                    Ok(Event::default().event("epoch").data(json))
+                })
+            })
+            .collect()
+    };
+
+    let stream: SseStream = match epoch_rx {
+        None => {
+            // Not currently training — emit the terminal event for the current status.
+            let terminal_event = {
                 let st = state.lock().unwrap();
                 match &st.training {
                     TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => {
                         let ep    = st.epoch_history.len();
                         let total = st.hyperparams.as_ref().map(|h| h.epochs).unwrap_or(0);
-                        if *was_stopped {
-                            format!(
-                                "event: stopped\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}\n\n",
-                                mp=model_path, el=elapsed_total_ms, ep=ep, total=total,
+                        let (event_name, json) = if *was_stopped {
+                            (
+                                "stopped",
+                                format!(
+                                    "{{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}",
+                                    mp = model_path, el = elapsed_total_ms, ep = ep, total = total,
+                                ),
                             )
                         } else {
-                            format!(
-                                "event: done\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}\n\n",
-                                mp=model_path, el=elapsed_total_ms, ep=ep,
+                            (
+                                "done",
+                                format!(
+                                    "{{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}",
+                                    mp = model_path, el = elapsed_total_ms, ep = ep,
+                                ),
                             )
-                        }
+                        };
+                        Some(Ok(Event::default().event(event_name).data(json)))
                     }
                     TrainingStatus::Failed { reason } => {
-                        format!(
-                            "event: failed\ndata: {{\"reason\":\"{}\"}}\n\n",
-                            reason.replace('"', "\\\""),
-                        )
+                        let json = format!(
+                            "{{\"reason\":\"{}\"}}",
+                            reason.replace('"', "\\\"")
+                        );
+                        Some(Ok(Event::default().event("failed").data(json)))
                     }
-                    _ => String::new(), // Idle — close without event
+                    _ => None, // Idle — close without event
                 }
             };
-            if !msg.is_empty() {
-                let _ = write_all(&mut writer, msg.as_bytes());
-            }
-            return;
+
+            let events: Vec<Result<Event, Infallible>> = history_events
+                .into_iter()
+                .chain(terminal_event.into_iter())
+                .collect();
+
+            Box::pin(stream::iter(events))
+        }
+        Some(rx_arc) => {
+            // Training is running — stream epoch events from the tokio mpsc channel.
+            let state_for_stream = state.clone();
+
+            let live_stream = stream::unfold(
+                (rx_arc, state_for_stream, false),
+                |(rx_arc, state, done)| async move {
+                    if done {
+                        return None;
+                    }
+
+                    // Try to receive the next epoch stats with a 500 ms timeout.
+                    let recv_result = {
+                        let mut rx = rx_arc.lock().await;
+                        tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                    };
+
+                    match recv_result {
+                        Ok(Some(stats)) => {
+                            // Accumulate stats in epoch_history.
+                            {
+                                let mut st = state.lock().unwrap();
+                                st.epoch_history.push(stats.clone());
+                            }
+                            let event = match serde_json::to_string(&stats) {
+                                Ok(json) => Ok(Event::default().event("epoch").data(json)),
+                                Err(_)   => Ok(Event::default().event("epoch").data("{}")),
+                            };
+                            Some((event, (rx_arc, state, false)))
+                        }
+                        Ok(None) => {
+                            // Channel closed — training finished. Emit terminal event.
+                            let terminal = build_terminal_event(&state);
+                            // Signal done so the stream ends after this event.
+                            Some((terminal, (rx_arc, state, true)))
+                        }
+                        Err(_timeout) => {
+                            // Timeout — emit an SSE comment (keepalive).
+                            Some((
+                                Ok(Event::default().comment("ping")),
+                                (rx_arc, state, false),
+                            ))
+                        }
+                    }
+                },
+            );
+
+            let combined = stream::iter(history_events).chain(live_stream);
+            Box::pin(combined)
         }
     };
 
-    // Collect history so far from state and replay it immediately.
-    {
-        let st = state.lock().unwrap();
-        for stats in &st.epoch_history {
-            if let Ok(json) = serde_json::to_string(stats) {
-                let msg = format!("event: epoch\ndata: {}\n\n", json);
-                if write_all(&mut writer, msg.as_bytes()).is_err() { return; }
-            }
-        }
-    }
-
-    // Main receive loop.
-    loop {
-        let result = {
-            let rx = rx_arc.lock().unwrap();
-            rx.recv_timeout(Duration::from_millis(500))
-        };
-
-        match result {
-            Ok(stats) => {
-                // Push to epoch_history.
-                {
-                    let mut st = state.lock().unwrap();
-                    st.epoch_history.push(stats.clone());
-                }
-
-                match serde_json::to_string(&stats) {
-                    Ok(json) => {
-                        let msg = format!("event: epoch\ndata: {}\n\n", json);
-                        if write_all(&mut writer, msg.as_bytes()).is_err() { return; }
-                    }
-                    Err(_) => continue,
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Keep-alive ping.
-                if write_all(&mut writer, b": ping\n\n").is_err() { return; }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Training thread closed the sender — check final status.
-                let training_status_json = {
-                    let st = state.lock().unwrap();
-                    match &st.training {
-                        TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => {
-                            let ep    = st.epoch_history.len();
-                            let total = st.hyperparams.as_ref().map(|h| h.epochs).unwrap_or(0);
-                            if *was_stopped {
-                                // User stopped training; model still saved — emit stopped event
-                                // with the model path so the client can persist it.
-                                format!(
-                                    "event: stopped\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}\n\n",
-                                    mp    = model_path,
-                                    el    = elapsed_total_ms,
-                                    ep    = ep,
-                                    total = total,
-                                )
-                            } else {
-                                format!(
-                                    "event: done\ndata: {{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}\n\n",
-                                    mp = model_path,
-                                    el = elapsed_total_ms,
-                                    ep = ep,
-                                )
-                            }
-                        }
-                        TrainingStatus::Failed { reason } => {
-                            format!(
-                                "event: failed\ndata: {{\"reason\":\"{}\"}}\n\n",
-                                reason.replace('"', "\\\""),
-                            )
-                        }
-                        _ => String::new(), // Idle — close without event
-                    }
-                };
-                if !training_status_json.is_empty() {
-                    let _ = write_all(&mut writer, training_status_json.as_bytes());
-                }
-                return;
-            }
-        }
-    }
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
-/// Writes all bytes to the writer, returning `Err` on any I/O failure.
-fn write_all<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
-    w.write_all(data)?;
-    w.flush()
+/// Builds the terminal SSE event (done / stopped / failed) from current state.
+fn build_terminal_event(state: &SharedState) -> Result<Event, Infallible> {
+    let st = state.lock().unwrap();
+    match &st.training {
+        TrainingStatus::Done { model_path, elapsed_total_ms, was_stopped } => {
+            let ep    = st.epoch_history.len();
+            let total = st.hyperparams.as_ref().map(|h| h.epochs).unwrap_or(0);
+            let (event_name, json) = if *was_stopped {
+                (
+                    "stopped",
+                    format!(
+                        "{{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epoch_reached\":{ep},\"total_epochs\":{total}}}",
+                        mp = model_path, el = elapsed_total_ms, ep = ep, total = total,
+                    ),
+                )
+            } else {
+                (
+                    "done",
+                    format!(
+                        "{{\"model_path\":\"{mp}\",\"elapsed_total_ms\":{el},\"epochs_completed\":{ep}}}",
+                        mp = model_path, el = elapsed_total_ms, ep = ep,
+                    ),
+                )
+            };
+            Ok(Event::default().event(event_name).data(json))
+        }
+        TrainingStatus::Failed { reason } => {
+            let json = format!("{{\"reason\":\"{}\"}}", reason.replace('"', "\\\""));
+            Ok(Event::default().event("failed").data(json))
+        }
+        _ => {
+            // Idle or unexpected state.
+            Ok(Event::default().event("done").data("{}"))
+        }
+    }
 }

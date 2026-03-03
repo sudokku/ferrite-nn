@@ -1,68 +1,119 @@
-use tiny_http::{Request, Response};
-use std::io::Cursor;
+use axum::{extract::State, Json};
+use serde::{Deserialize, Serialize};
 
-use crate::state::{DatasetState, FlashMessage, SharedState};
-use crate::util::form::{parse_form, form_get};
-use crate::util::multipart::{extract_boundary, multipart_extract_file,
-                              multipart_extract_file_by_name,
-                              extract_all_text_fields};
+use crate::routes::SharedState;
+use crate::state::{DatasetState, FlashMessage};
 use crate::util::csv::{parse_csv, LabelMode, builtin_xor, builtin_circles, builtin_blobs};
 use crate::util::idx::parse_idx_pair;
-use crate::render::{render_page, Page};
-use crate::handlers::architect::{render_flash_html, html_escape};
 
-const MAX_CSV_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+const MAX_CSV_BYTES: usize = 50 * 1024 * 1024;  // 50 MB
 const MAX_IDX_BYTES: usize = 100 * 1024 * 1024; // 100 MB (MNIST train set is ~47 MB)
 
 // ---------------------------------------------------------------------------
-// GET /dataset
+// Response types
 // ---------------------------------------------------------------------------
 
-pub fn handle_get(state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let mut st = state.lock().unwrap();
-    let flash  = st.take_flash();
-    let mask   = st.tab_unlock_mask();
-    let ds     = st.dataset.clone();
-    drop(st);
+#[derive(Serialize)]
+pub struct DatasetResponse {
+    pub loaded: bool,
+    pub source_name: Option<String>,
+    pub feature_count: Option<usize>,
+    pub label_count: Option<usize>,
+    pub total_rows: Option<usize>,
+    pub train_rows: Option<usize>,
+    pub val_rows: Option<usize>,
+    pub val_split_pct: Option<u8>,
+    pub preview_rows: Option<Vec<PreviewRow>>,
+    pub tab_unlock: u8,
+    pub error: Option<String>,
+}
 
-    crate::routes::html_response(build_dataset_page(&ds, None, flash, mask, "upload"))
+#[derive(Serialize)]
+pub struct PreviewRow {
+    pub inputs: Vec<f64>,
+    pub labels: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
-// POST /dataset/upload
+// Request types
 // ---------------------------------------------------------------------------
 
-pub fn handle_upload(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let content_type = request.headers().iter()
-        .find(|h| h.field.equiv("Content-Type"))
-        .map(|h| h.value.as_str().to_owned())
-        .unwrap_or_default();
+#[derive(Deserialize)]
+pub struct BuiltinRequest {
+    pub name: String,      // "xor" | "circles" | "blobs"
+    pub val_split: Option<u8>,
+}
 
-    let boundary = match extract_boundary(&content_type) {
-        Some(b) => b,
-        None    => return show_error(&state, "Invalid multipart request.", "upload"),
-    };
+// ---------------------------------------------------------------------------
+// GET /api/dataset
+// ---------------------------------------------------------------------------
 
-    let mut body: Vec<u8> = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut body);
+pub async fn handle_get(State(state): State<SharedState>) -> Json<DatasetResponse> {
+    let st = state.lock().unwrap();
+    let tab_unlock = st.tab_unlock_mask();
+    let ds = st.dataset.clone();
+    drop(st);
 
-    if body.len() > MAX_CSV_BYTES {
-        return show_error(&state, "File exceeds 50 MB limit.", "upload");
+    Json(build_response(ds, tab_unlock, None))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/dataset/upload   (CSV multipart)
+// ---------------------------------------------------------------------------
+
+pub async fn handle_upload(
+    State(state): State<SharedState>,
+    mut multipart: axum::extract::Multipart,
+) -> Json<serde_json::Value> {
+    // Collect all multipart fields.
+    let mut csv_bytes: Option<Vec<u8>> = None;
+    let mut val_split: u8 = 20;
+    let mut label_mode_s = "class_index".to_owned();
+    let mut n_classes: usize = 2;
+    let mut n_label_cols: usize = 1;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "dataset" => {
+                match field.bytes().await {
+                    Ok(b) => {
+                        if b.len() > MAX_CSV_BYTES {
+                            return Json(serde_json::json!({"error": "File exceeds 50 MB limit."}));
+                        }
+                        csv_bytes = Some(b.to_vec());
+                    }
+                    Err(_) => return Json(serde_json::json!({"error": "Failed to read uploaded file."})),
+                }
+            }
+            "val_split" => {
+                if let Ok(text) = field.text().await {
+                    val_split = text.trim().parse::<u8>().unwrap_or(20).min(50);
+                }
+            }
+            "label_mode" => {
+                if let Ok(text) = field.text().await {
+                    label_mode_s = text.trim().to_owned();
+                }
+            }
+            "n_classes" => {
+                if let Ok(text) = field.text().await {
+                    n_classes = text.trim().parse::<usize>().unwrap_or(2).max(2);
+                }
+            }
+            "n_label_cols" => {
+                if let Ok(text) = field.text().await {
+                    n_label_cols = text.trim().parse::<usize>().unwrap_or(1).max(1);
+                }
+            }
+            _ => { let _ = field.bytes().await; }
+        }
     }
 
-    let csv_bytes = match multipart_extract_file(&body, &boundary) {
+    let csv_bytes = match csv_bytes {
         Some(b) if !b.is_empty() => b,
-        _ => return show_error(&state, "No CSV file was uploaded.", "upload"),
+        _ => return Json(serde_json::json!({"error": "No CSV file was uploaded."})),
     };
-
-    // Parse text fields from multipart.
-    let fields = extract_all_text_fields(&body, &boundary);
-    let field_get = |k: &str| fields.iter().find(|(name,_)| name == k).map(|(_,v)| v.as_str()).unwrap_or("");
-
-    let val_split: u8 = field_get("val_split").trim().parse().unwrap_or(20).min(50);
-    let label_mode_s  = field_get("label_mode");
-    let n_classes: usize  = field_get("n_classes").trim().parse().unwrap_or(2).max(2);
-    let n_label_cols: usize = field_get("n_label_cols").trim().parse().unwrap_or(1).max(1);
 
     let label_mode = if label_mode_s == "one_hot" {
         LabelMode::OneHot { n_label_cols }
@@ -72,7 +123,7 @@ pub fn handle_upload(request: &mut Request, state: SharedState) -> Response<Curs
 
     let (inputs, labels) = match parse_csv(&csv_bytes, label_mode) {
         Ok(r)  => r,
-        Err(e) => return show_error(&state, &e.to_string(), "upload"),
+        Err(e) => return Json(serde_json::json!({"error": e.to_string()})),
     };
 
     // Validate feature count against spec.
@@ -85,51 +136,140 @@ pub fn handle_upload(request: &mut Request, state: SharedState) -> Response<Curs
                     "Feature count mismatch: model expects {} inputs, CSV has {}.",
                     expected, inputs[0].len()
                 );
-                drop(st);
-                return show_error(&state, &err, "upload");
+                return Json(serde_json::json!({"error": err}));
             }
         }
     }
 
     let ds = build_dataset_state(inputs, labels, val_split, "CSV upload".to_owned());
+    let tab_unlock = {
+        let mut st = state.lock().unwrap();
+        st.dataset = Some(ds.clone());
+        st.flash   = Some(FlashMessage::success("Dataset loaded successfully."));
+        st.tab_unlock_mask()
+    };
 
-    let mut st = state.lock().unwrap();
-    st.dataset = Some(ds);
-    st.flash   = Some(FlashMessage::success("Dataset loaded successfully."));
-    drop(st);
-
-    crate::routes::redirect("/dataset")
+    Json(serde_json::to_value(build_response(Some(ds), tab_unlock, None)).unwrap())
 }
 
 // ---------------------------------------------------------------------------
-// POST /dataset/builtin
+// POST /api/dataset/upload-idx   (IDX multipart)
 // ---------------------------------------------------------------------------
 
-pub fn handle_builtin(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
-    let pairs = parse_form(&body);
+pub async fn handle_upload_idx(
+    State(state): State<SharedState>,
+    mut multipart: axum::extract::Multipart,
+) -> Json<serde_json::Value> {
+    let mut image_bytes: Option<Vec<u8>> = None;
+    let mut label_bytes: Option<Vec<u8>> = None;
+    let mut val_split: u8 = 10;
+    let mut n_classes: usize = 10;
 
-    let name      = form_get(&pairs, "builtin_name").unwrap_or("xor");
-    // XOR has only 4 samples — any validation split causes misleading metrics
-    // because the model never sees the held-out sample(s) during training.
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "images_file" => {
+                match field.bytes().await {
+                    Ok(b) => {
+                        if b.len() > MAX_IDX_BYTES {
+                            return Json(serde_json::json!({"error": "Upload exceeds 100 MB limit."}));
+                        }
+                        image_bytes = Some(b.to_vec());
+                    }
+                    Err(_) => return Json(serde_json::json!({"error": "Failed to read images file."})),
+                }
+            }
+            "labels_file" => {
+                match field.bytes().await {
+                    Ok(b) => {
+                        label_bytes = Some(b.to_vec());
+                    }
+                    Err(_) => return Json(serde_json::json!({"error": "Failed to read labels file."})),
+                }
+            }
+            "val_split" => {
+                if let Ok(text) = field.text().await {
+                    val_split = text.trim().parse::<u8>().unwrap_or(10).min(50);
+                }
+            }
+            "n_classes" => {
+                if let Ok(text) = field.text().await {
+                    n_classes = text.trim().parse::<usize>().unwrap_or(10).max(2);
+                }
+            }
+            _ => { let _ = field.bytes().await; }
+        }
+    }
+
+    let image_bytes = match image_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return Json(serde_json::json!({"error": "No IDX image file was uploaded (field: images_file)."})),
+    };
+    let label_bytes = match label_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return Json(serde_json::json!({"error": "No IDX label file was uploaded (field: labels_file)."})),
+    };
+
+    let (inputs, labels) = match parse_idx_pair(&image_bytes, &label_bytes, n_classes) {
+        Ok(r)  => r,
+        Err(e) => return Json(serde_json::json!({"error": e})),
+    };
+
+    // Validate feature count against spec.
+    {
+        let st = state.lock().unwrap();
+        if let Some(spec) = &st.spec {
+            let expected = spec.layers.first().map(|l| l.input_size).unwrap_or(0);
+            if expected > 0 && !inputs.is_empty() && inputs[0].len() != expected {
+                let err = format!(
+                    "Feature count mismatch: model expects {} inputs, IDX images have {} pixels.",
+                    expected, inputs[0].len()
+                );
+                return Json(serde_json::json!({"error": err}));
+            }
+        }
+    }
+
+    let source_name = format!(
+        "IDX upload ({} samples, {}x{} px, {} classes)",
+        inputs.len(),
+        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
+        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
+        n_classes,
+    );
+
+    let ds = build_dataset_state(inputs, labels, val_split, source_name);
+    let tab_unlock = {
+        let mut st = state.lock().unwrap();
+        st.dataset = Some(ds.clone());
+        st.flash   = Some(FlashMessage::success("IDX dataset loaded successfully."));
+        st.tab_unlock_mask()
+    };
+
+    Json(serde_json::to_value(build_response(Some(ds), tab_unlock, None)).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/dataset/builtin
+// ---------------------------------------------------------------------------
+
+pub async fn handle_builtin(
+    State(state): State<SharedState>,
+    Json(req): Json<BuiltinRequest>,
+) -> Json<serde_json::Value> {
+    let name = req.name.as_str();
+
+    // XOR has only 4 samples — any validation split causes misleading metrics.
     let val_split: u8 = if name == "xor" {
         0
     } else {
-        form_get(&pairs, "val_split")
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(20)
-            .min(50)
+        req.val_split.unwrap_or(20).min(50)
     };
 
     let (inputs, labels, source_name) = match name {
-        "circles" => { let (i,l) = builtin_circles(200); (i, l, "Circles (200)".to_owned()) }
-        "blobs"   => { let (i,l) = builtin_blobs(200);   (i, l, "Blobs (200)".to_owned())   }
-        "mnist"   => {
-            // MNIST is only available if IDX files exist.
-            return show_error(&state, "MNIST dataset not implemented in built-in loader; train with examples/mnist.rs first.", "builtin");
-        }
-        _         => { let (i,l) = builtin_xor();        (i, l, "XOR".to_owned())            }
+        "circles" => { let (i, l) = builtin_circles(200); (i, l, "Circles (200)".to_owned()) }
+        "blobs"   => { let (i, l) = builtin_blobs(200);   (i, l, "Blobs (200)".to_owned())   }
+        _         => { let (i, l) = builtin_xor();        (i, l, "XOR".to_owned())            }
     };
 
     // Validate feature count.
@@ -142,113 +282,67 @@ pub fn handle_builtin(request: &mut Request, state: SharedState) -> Response<Cur
                     "Feature count mismatch: model expects {} inputs, '{}' has {}.",
                     expected, name, inputs[0].len()
                 );
-                drop(st);
-                return show_error(&state, &err, "builtin");
+                return Json(serde_json::json!({"error": err}));
             }
         }
     }
 
     let ds = build_dataset_state(inputs, labels, val_split, source_name);
-
-    let mut st = state.lock().unwrap();
-    st.dataset = Some(ds);
-    st.flash   = Some(FlashMessage::success("Dataset loaded successfully."));
-    drop(st);
-
-    crate::routes::redirect("/dataset")
-}
-
-// ---------------------------------------------------------------------------
-// POST /dataset/upload-idx
-// ---------------------------------------------------------------------------
-
-pub fn handle_upload_idx(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let content_type = request.headers().iter()
-        .find(|h| h.field.equiv("Content-Type"))
-        .map(|h| h.value.as_str().to_owned())
-        .unwrap_or_default();
-
-    let boundary = match extract_boundary(&content_type) {
-        Some(b) => b,
-        None    => return show_error(&state, "Invalid multipart request.", "idx"),
+    let tab_unlock = {
+        let mut st = state.lock().unwrap();
+        st.dataset = Some(ds.clone());
+        st.flash   = Some(FlashMessage::success("Dataset loaded successfully."));
+        st.tab_unlock_mask()
     };
 
-    let mut body: Vec<u8> = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut body);
-
-    if body.len() > MAX_IDX_BYTES {
-        return show_error(&state, "Upload exceeds 100 MB limit.", "idx");
-    }
-
-    let image_bytes = match multipart_extract_file_by_name(&body, &boundary, "images_file") {
-        Some(b) if !b.is_empty() => b,
-        _ => return show_error(&state, "No IDX image file was uploaded (field: images_file).", "idx"),
-    };
-
-    let label_bytes = match multipart_extract_file_by_name(&body, &boundary, "labels_file") {
-        Some(b) if !b.is_empty() => b,
-        _ => return show_error(&state, "No IDX label file was uploaded (field: labels_file).", "idx"),
-    };
-
-    // Parse text fields from multipart.
-    let fields = extract_all_text_fields(&body, &boundary);
-    let field_get = |k: &str| fields.iter().find(|(name,_)| name == k).map(|(_,v)| v.as_str()).unwrap_or("");
-
-    let val_split: u8  = field_get("val_split").trim().parse().unwrap_or(10).min(50);
-    let n_classes: usize = field_get("n_classes").trim().parse().unwrap_or(10).max(2);
-
-    let (inputs, labels) = match parse_idx_pair(&image_bytes, &label_bytes, n_classes) {
-        Ok(r)  => r,
-        Err(e) => return show_error(&state, &e, "idx"),
-    };
-
-    // Validate feature count against the currently-loaded architecture spec.
-    {
-        let st = state.lock().unwrap();
-        if let Some(spec) = &st.spec {
-            let expected = spec.layers.first().map(|l| l.input_size).unwrap_or(0);
-            if expected > 0 && !inputs.is_empty() && inputs[0].len() != expected {
-                let err = format!(
-                    "Feature count mismatch: model expects {} inputs, IDX images have {} pixels.",
-                    expected, inputs[0].len()
-                );
-                drop(st);
-                return show_error(&state, &err, "idx");
-            }
-        }
-    }
-
-    let source_name = format!("IDX upload ({} samples, {}×{} px, {} classes)",
-        inputs.len(),
-        // derive rows/cols from pixel count — best effort
-        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
-        (inputs.first().map(|r| r.len()).unwrap_or(0) as f64).sqrt() as usize,
-        n_classes,
-    );
-
-    let ds = build_dataset_state(inputs, labels, val_split, source_name);
-
-    let mut st = state.lock().unwrap();
-    st.dataset = Some(ds);
-    st.flash   = Some(FlashMessage::success("IDX dataset loaded successfully."));
-    drop(st);
-
-    crate::routes::redirect("/dataset")
+    Json(serde_json::to_value(build_response(Some(ds), tab_unlock, None)).unwrap())
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn show_error(state: &SharedState, msg: &str, active_panel: &str) -> Response<Cursor<Vec<u8>>> {
-    let st   = state.lock().unwrap();
-    let mask = st.tab_unlock_mask();
-    let ds   = st.dataset.clone();
-    drop(st);
-    crate::routes::html_response(build_dataset_page(&ds, Some(msg), None, mask, active_panel))
+fn build_response(
+    ds: Option<DatasetState>,
+    tab_unlock: u8,
+    error: Option<String>,
+) -> DatasetResponse {
+    match ds {
+        None => DatasetResponse {
+            loaded: false,
+            source_name: None,
+            feature_count: None,
+            label_count: None,
+            total_rows: None,
+            train_rows: None,
+            val_rows: None,
+            val_split_pct: None,
+            preview_rows: None,
+            tab_unlock,
+            error,
+        },
+        Some(d) => {
+            let preview = d.preview_rows.iter()
+                .map(|(inp, lbl)| PreviewRow { inputs: inp.clone(), labels: lbl.clone() })
+                .collect();
+            DatasetResponse {
+                loaded: true,
+                source_name: Some(d.source_name.clone()),
+                feature_count: Some(d.feature_count),
+                label_count: Some(d.label_count),
+                total_rows: Some(d.total_rows),
+                train_rows: Some(d.train_inputs.len()),
+                val_rows: Some(d.val_inputs.len()),
+                val_split_pct: Some(d.val_split_pct),
+                preview_rows: Some(preview),
+                tab_unlock,
+                error,
+            }
+        }
+    }
 }
 
-fn build_dataset_state(
+pub fn build_dataset_state(
     inputs: Vec<Vec<f64>>,
     labels: Vec<Vec<f64>>,
     val_split_pct: u8,
@@ -258,7 +352,7 @@ fn build_dataset_state(
     let feature_count = inputs.first().map(|r| r.len()).unwrap_or(0);
     let label_count   = labels.first().map(|r| r.len()).unwrap_or(0);
 
-    let val_n = (total * val_split_pct as usize) / 100;
+    let val_n   = (total * val_split_pct as usize) / 100;
     let train_n = total - val_n;
 
     let preview_rows: Vec<(Vec<f64>, Vec<f64>)> = inputs.iter().zip(labels.iter())
@@ -281,86 +375,4 @@ fn build_dataset_state(
         source_name,
         preview_rows,
     }
-}
-
-fn build_dataset_page(
-    ds:           &Option<DatasetState>,
-    error:        Option<&str>,
-    flash:        Option<FlashMessage>,
-    tab_unlock:   u8,
-    active_panel: &str,
-) -> String {
-    let flash_html = render_flash_html(flash.as_ref());
-    let error_html = error.map(|e| {
-        format!(r#"<div class="flash flash-error" style="margin-top:14px">{}</div>"#, html_escape(e))
-    }).unwrap_or_default();
-
-    let upload_active  = if active_panel == "upload"  { "active" } else { "" };
-    let builtin_active = if active_panel == "builtin" { "active" } else { "" };
-    let idx_active     = if active_panel == "idx"     { "active" } else { "" };
-    let upload_hide    = if active_panel != "upload"  { "hidden" } else { "" };
-    let builtin_hide   = if active_panel != "builtin" { "hidden" } else { "" };
-    let idx_hide       = if active_panel != "idx"     { "hidden" } else { "" };
-
-    let summary_html = ds.as_ref().map(build_summary_html).unwrap_or_default();
-
-    render_page(Page::Dataset, tab_unlock, false, |tmpl| {
-        tmpl
-            .replace("{{FLASH_DATASET}}", &flash_html)
-            .replace("{{DS_UPLOAD_ACTIVE}}", upload_active)
-            .replace("{{DS_BUILTIN_ACTIVE}}", builtin_active)
-            .replace("{{DS_IDX_ACTIVE}}", idx_active)
-            .replace("{{DS_UPLOAD_HIDE}}", upload_hide)
-            .replace("{{DS_BUILTIN_HIDE}}", builtin_hide)
-            .replace("{{DS_IDX_HIDE}}", idx_hide)
-            .replace("{{DS_VAL_SPLIT}}", "20")
-            .replace("{{SEL_CI}}", " selected")
-            .replace("{{SEL_OH}}", "")
-            .replace("{{N_CLASSES_HIDE}}", "")
-            .replace("{{N_LABEL_COLS_HIDE}}", "hidden")
-            .replace("{{DS_N_CLASSES}}", "2")
-            .replace("{{DS_N_LABEL_COLS}}", "1")
-            .replace("{{SEL_XOR}}", "checked")
-            .replace("{{SEL_CIRCLES}}", "")
-            .replace("{{SEL_BLOBS}}", "")
-            .replace("{{MNIST_OPTION}}", "")
-            .replace("{{DS_ERROR}}", &error_html)
-            .replace("{{DS_SUMMARY}}", &summary_html)
-    })
-}
-
-fn build_summary_html(ds: &DatasetState) -> String {
-    let preview: String = ds.preview_rows.iter().enumerate().map(|(i, (inp, lbl))| {
-        let feat_str: String = inp.iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>().join(", ");
-        let lbl_str:  String = lbl.iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>().join(", ");
-        format!("<tr><td>{}</td><td>{}</td><td>{}</td></tr>", i+1, html_escape(&feat_str), html_escape(&lbl_str))
-    }).collect();
-
-    format!(
-        r#"<div class="card"><h2>Dataset Summary</h2>
-<table class="summary-table">
-  <tr><th>Source</th><td>{source}</td></tr>
-  <tr><th>Total rows</th><td>{total}</td></tr>
-  <tr><th>Features</th><td>{feats}</td></tr>
-  <tr><th>Labels</th><td>{lbls}</td></tr>
-  <tr><th>Training samples</th><td>{train_n}</td></tr>
-  <tr><th>Validation samples</th><td>{val_n}</td></tr>
-  <tr><th>Validation split</th><td>{split}%</td></tr>
-</table>
-<h3 style="margin-top:18px">First {preview_count} rows</h3>
-<table class="preview-table">
-  <thead><tr><th>#</th><th>Features</th><th>Labels</th></tr></thead>
-  <tbody>{preview}</tbody>
-</table>
-</div>"#,
-        source       = html_escape(&ds.source_name),
-        total        = ds.total_rows,
-        feats        = ds.feature_count,
-        lbls         = ds.label_count,
-        train_n      = ds.train_inputs.len(),
-        val_n        = ds.val_inputs.len(),
-        split        = ds.val_split_pct,
-        preview_count = ds.preview_rows.len(),
-        preview      = preview,
-    )
 }

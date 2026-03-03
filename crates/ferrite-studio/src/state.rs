@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+use std::sync::{Arc, atomic::AtomicBool};
+use tokio::sync::mpsc;
 use ferrite_nn::{Network, NetworkSpec, EpochStats};
 
 // ---------------------------------------------------------------------------
@@ -49,9 +50,11 @@ pub enum TrainingStatus {
     /// No training has been started yet.
     Idle,
     /// Training is running in a background thread.
+    /// Uses `tokio::sync::mpsc::Receiver` so that the async SSE handler
+    /// can receive epoch stats without blocking the async runtime.
     Running {
         stop_flag:    Arc<AtomicBool>,
-        epoch_rx:     Arc<Mutex<mpsc::Receiver<EpochStats>>>,
+        epoch_rx:     Arc<tokio::sync::Mutex<mpsc::Receiver<EpochStats>>>,
         total_epochs: usize,
     },
     /// Training completed (naturally or via Stop) and the model was saved.
@@ -129,7 +132,7 @@ impl StudioState {
     /// - bit 0 (Architect) — always set
     /// - bit 1 (Dataset)   — spec is saved
     /// - bit 2 (Train)     — dataset is loaded
-    /// - bit 3 (Evaluate)  — training is Done or Stopped
+    /// - bit 3 (Evaluate)  — training is Done
     /// - bit 4 (Test)      — always set
     pub fn tab_unlock_mask(&self) -> u8 {
         let mut mask: u8 = 0b0_0001; // Architect always unlocked
@@ -155,6 +158,3 @@ impl StudioState {
         self.flash.take()
     }
 }
-
-/// Shared state type — an `Arc<Mutex<StudioState>>` passed to every handler.
-pub type SharedState = Arc<Mutex<StudioState>>;

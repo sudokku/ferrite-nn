@@ -1,127 +1,220 @@
-use std::io::Cursor;
-use tiny_http::{Request, Response};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
+use serde::Serialize;
+use std::collections::HashMap;
 
-use ferrite_nn::{ActivationFunction, InputType, Network};
+use ferrite_nn::{ActivationFunction, Network};
 
-use crate::state::SharedState;
-use crate::util::form::{parse_form, form_get};
-use crate::util::multipart::{extract_boundary, multipart_extract_file_by_name, extract_text_field,
-                              find_subsequence, split_on};
+use crate::routes::SharedState;
 use crate::util::image::{image_bytes_to_grayscale_input, image_bytes_to_rgb_input};
-use crate::render::{render_page, Page};
-use crate::handlers::architect::html_escape;
 
 // ---------------------------------------------------------------------------
-// GET /test  and  GET /test?model=NAME
+// Response types
 // ---------------------------------------------------------------------------
 
-pub fn handle_get(query: String, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let st   = state.lock().unwrap();
-    let mask = st.tab_unlock_mask();
-    drop(st);
+#[derive(Serialize)]
+pub struct TestResponse {
+    pub models: Vec<String>,
+    pub selected: Option<String>,
+    pub model_info: Option<ModelInfo>,
+    pub tab_unlock: u8,
+}
 
-    let q_pairs  = parse_form(&query);
-    let selected = form_get(&q_pairs, "model").unwrap_or("").to_owned();
+#[derive(Serialize)]
+pub struct ModelInfo {
+    pub name: String,
+    pub input_type: Option<serde_json::Value>,  // serialized InputType or null
+    pub output_labels: Option<Vec<String>>,
+    pub input_size: usize,
+    pub output_size: usize,
+}
 
-    let page = build_test_page(&selected, "", mask);
-    crate::routes::html_response(page)
+#[derive(Serialize)]
+pub struct InferResult {
+    pub result_type: String,          // "softmax" | "sigmoid" | "raw"
+    pub prediction: Option<String>,
+    pub confidence: Option<f64>,
+    pub all_scores: Vec<ScoreEntry>,
+    pub raw_values: Option<Vec<f64>>,
+}
+
+#[derive(Serialize)]
+pub struct ScoreEntry {
+    pub label: String,
+    pub score: f64,
 }
 
 // ---------------------------------------------------------------------------
-// POST /test/infer
+// GET /api/test?model=NAME
 // ---------------------------------------------------------------------------
 
-pub fn handle_infer(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let st   = state.lock().unwrap();
-    let mask = st.tab_unlock_mask();
+pub async fn handle_get(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<TestResponse> {
+    let st = state.lock().unwrap();
+    let tab_unlock = st.tab_unlock_mask();
     drop(st);
 
-    let content_type = request.headers().iter()
-        .find(|h| h.field.equiv("Content-Type"))
-        .map(|h| h.value.as_str().to_owned())
-        .unwrap_or_default();
+    let selected = params.get("model").cloned().filter(|s| !s.is_empty());
+    let models   = list_models();
 
-    let boundary = extract_boundary(&content_type).unwrap_or_default();
+    let model_info = selected.as_deref().and_then(|name| {
+        load_model_info(name)
+    });
 
-    let mut body_bytes: Vec<u8> = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut body_bytes);
-
-    let model_name = extract_text_field(&body_bytes, &boundary, "model")
-        .unwrap_or_default();
-
-    let input_mode = extract_text_field(&body_bytes, &boundary, "input_mode")
-        .unwrap_or_else(|| "numeric".to_string());
-
-    let width: u32 = extract_text_field(&body_bytes, &boundary, "input_width")
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(28);
-
-    let height: u32 = extract_text_field(&body_bytes, &boundary, "input_height")
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(28);
-
-    let result_html = match input_mode.as_str() {
-        "grayscale" => {
-            match multipart_extract_file_by_name(&body_bytes, &boundary, "image_file") {
-                Some(bytes) if !bytes.is_empty() => {
-                    run_inference_image_grayscale(&model_name, &bytes, width, height)
-                }
-                _ => error_html("No image file was uploaded."),
-            }
-        }
-        "rgb" => {
-            match multipart_extract_file_by_name(&body_bytes, &boundary, "image_file") {
-                Some(bytes) if !bytes.is_empty() => {
-                    run_inference_image_rgb(&model_name, &bytes, width, height)
-                }
-                _ => error_html("No image file was uploaded."),
-            }
-        }
-        _ => {
-            // numeric: textarea value arrives as a multipart text field named "inputs"
-            let raw_inputs = extract_text_field(&body_bytes, &boundary, "inputs")
-                .unwrap_or_default();
-            run_inference_numeric(&model_name, &raw_inputs)
-        }
-    };
-
-    let page = build_test_page(&model_name, &result_html, mask);
-    crate::routes::html_response(page)
-}
-
-// ---------------------------------------------------------------------------
-// Page builder
-// ---------------------------------------------------------------------------
-
-fn build_test_page(selected: &str, result_html: &str, tab_unlock: u8) -> String {
-    let models = list_models();
-    let model_options = build_model_options(&models, selected);
-    let input_section = build_input_section(selected);
-
-    // The form always uses multipart so all three input modes work uniformly.
-    let full_input_section = format!(
-        r#"<form method="POST" action="/test/infer" enctype="multipart/form-data" id="test-infer-form" style="margin-top:18px">
-  <input type="hidden" name="model" value="{model}">
-  {input}
-  <div class="mt"><button type="submit" class="btn btn-primary">Run Inference</button></div>
-</form>"#,
-        model = html_escape(selected),
-        input = input_section,
-    );
-
-    render_page(Page::Test, tab_unlock, false, |tmpl| {
-        tmpl
-            .replace("{{MODEL_OPTIONS}}", &model_options)
-            .replace("{{TEST_INPUT_SECTION}}", &full_input_section)
-            .replace("{{TEST_RESULT_SECTION}}", result_html)
+    Json(TestResponse {
+        models,
+        selected,
+        model_info,
+        tab_unlock,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Model listing
+// POST /api/test/infer   (multipart)
 // ---------------------------------------------------------------------------
 
-fn list_models() -> Vec<String> {
+pub async fn handle_infer(
+    State(_state): State<SharedState>,
+    mut multipart: axum::extract::Multipart,
+) -> Json<serde_json::Value> {
+
+    // Collect multipart fields.
+    let mut model_name  = String::new();
+    let mut input_mode  = "numeric".to_owned();
+    let mut width: u32  = 28;
+    let mut height: u32 = 28;
+    let mut inputs_text = String::new();
+    let mut image_bytes: Option<Vec<u8>> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "model" => {
+                if let Ok(t) = field.text().await { model_name = t; }
+            }
+            "input_mode" => {
+                if let Ok(t) = field.text().await { input_mode = t; }
+            }
+            "input_width" => {
+                if let Ok(t) = field.text().await {
+                    width = t.trim().parse().unwrap_or(28);
+                }
+            }
+            "input_height" => {
+                if let Ok(t) = field.text().await {
+                    height = t.trim().parse().unwrap_or(28);
+                }
+            }
+            "inputs" => {
+                if let Ok(t) = field.text().await { inputs_text = t; }
+            }
+            "image_file" => {
+                if let Ok(b) = field.bytes().await {
+                    if !b.is_empty() {
+                        image_bytes = Some(b.to_vec());
+                    }
+                }
+            }
+            _ => { let _ = field.bytes().await; }
+        }
+    }
+
+    let result = match input_mode.as_str() {
+        "grayscale" => match image_bytes {
+            Some(bytes) => run_infer_grayscale(&model_name, &bytes, width, height),
+            None        => Err("No image file was uploaded.".to_owned()),
+        },
+        "rgb" => match image_bytes {
+            Some(bytes) => run_infer_rgb(&model_name, &bytes, width, height),
+            None        => Err("No image file was uploaded.".to_owned()),
+        },
+        _ => run_infer_numeric(&model_name, &inputs_text),
+    };
+
+    match result {
+        Ok(infer) => Json(serde_json::to_value(infer).unwrap_or(serde_json::json!({}))),
+        Err(e)    => Json(serde_json::json!({"error": e})),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/test/import-model   (multipart)
+// ---------------------------------------------------------------------------
+
+pub async fn handle_import_model(
+    State(_state): State<SharedState>,
+    mut multipart: axum::extract::Multipart,
+) -> Json<serde_json::Value> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut raw_filename = "imported_model".to_owned();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name     = field.name().unwrap_or("").to_owned();
+        let filename = field.file_name().unwrap_or("").to_owned();
+        if name == "model_file" {
+            if !filename.is_empty() {
+                raw_filename = filename;
+            }
+            match field.bytes().await {
+                Ok(b) if !b.is_empty() => { file_bytes = Some(b.to_vec()); }
+                _ => {}
+            }
+        } else {
+            let _ = field.bytes().await;
+        }
+    }
+
+    let file_bytes = match file_bytes {
+        Some(b) => b,
+        None    => return Json(serde_json::json!({"error": "No JSON file was uploaded."})),
+    };
+
+    // Basic validation: must be valid JSON with a "layers" key.
+    let json_val: serde_json::Value = match serde_json::from_slice(&file_bytes) {
+        Ok(v)  => v,
+        Err(_) => return Json(serde_json::json!({"error": "Uploaded file is not valid JSON."})),
+    };
+    if json_val.get("layers").is_none() {
+        return Json(serde_json::json!({
+            "error": "JSON does not appear to be a Ferrite model (missing \"layers\" field)."
+        }));
+    }
+
+    // Sanitize the filename stem.
+    let stem = std::path::Path::new(&raw_filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("imported_model");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let model_name = if sanitized.is_empty() { "imported_model".to_owned() } else { sanitized };
+
+    let model_dir  = "trained_models";
+    let model_path = format!("{}/{}.json", model_dir, model_name);
+
+    if let Err(_) = std::fs::create_dir_all(model_dir) {
+        return Json(serde_json::json!({"error": "Could not create trained_models/ directory."}));
+    }
+    if let Err(_) = std::fs::write(&model_path, &file_bytes) {
+        return Json(serde_json::json!({
+            "error": format!("Could not write model to '{}'.", model_path)
+        }));
+    }
+
+    Json(serde_json::json!({"ok": true, "name": model_name}))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — model listing and info
+// ---------------------------------------------------------------------------
+
+pub fn list_models() -> Vec<String> {
     let dir = "trained_models";
     match std::fs::read_dir(dir) {
         Ok(entries) => {
@@ -142,399 +235,39 @@ fn list_models() -> Vec<String> {
     }
 }
 
-fn build_model_options(models: &[String], selected: &str) -> String {
-    if models.is_empty() {
-        return r#"<option disabled>No models found in trained_models/</option>"#.into();
-    }
-    models.iter().map(|name| {
-        let sel = if name == selected { " selected" } else { "" };
-        format!("<option value=\"{}\"{}>{}</option>", html_escape(name), sel, html_escape(name))
-    }).collect::<Vec<_>>().join("\n")
-}
-
-// ---------------------------------------------------------------------------
-// Input section — dispatches on model metadata
-// ---------------------------------------------------------------------------
-
-fn build_input_section(model_name: &str) -> String {
-    if model_name.is_empty() {
-        // No model selected yet — show numeric textarea as a sensible default.
-        return build_input_section_no_metadata();
-    }
-
-    let path = format!("trained_models/{}.json", model_name);
-    let network = Network::load_json(&path).ok();
-    let input_type = network.as_ref()
-        .and_then(|n| n.metadata.as_ref())
+fn load_model_info(name: &str) -> Option<ModelInfo> {
+    if name.is_empty() { return None; }
+    let path = format!("trained_models/{}.json", name);
+    let network = Network::load_json(&path).ok()?;
+    let input_size  = network.input_size();
+    let output_size = network.layers.last().map(|l| l.size).unwrap_or(0);
+    let input_type  = network.metadata.as_ref()
         .and_then(|m| m.input_type.as_ref())
-        .cloned();
+        .and_then(|it| serde_json::to_value(it).ok());
+    let output_labels = network.metadata.as_ref()
+        .and_then(|m| m.output_labels.clone());
 
-    match input_type {
-        Some(InputType::ImageGrayscale { width, height }) => {
-            // Metadata fully specifies: Upload | Draw toggle.
-            build_input_section_grayscale_known(width, height)
-        }
-        Some(InputType::ImageRgb { width, height }) => {
-            // Metadata fully specifies: Upload only.
-            build_input_section_rgb_known(width, height)
-        }
-        Some(InputType::Numeric) => {
-            // Metadata says numeric — textarea only, no toggle.
-            build_input_section_numeric_only()
-        }
-        None => {
-            // No metadata: three-way selector so user picks the mode.
-            build_input_section_no_metadata()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Input section variants
-// ---------------------------------------------------------------------------
-
-/// Three-way selector: Numeric (default) | Grayscale Image | RGB Image.
-/// Used when `metadata.input_type` is `None`.
-fn build_input_section_no_metadata() -> String {
-    format!(
-        r#"<div id="test-mode-group" class="toggle-group" style="margin-top:16px;margin-bottom:0">
-  <button type="button" class="toggle-btn active" data-mode="numeric"
-          onclick="selectTestInputMode('numeric')">Numeric</button>
-  <button type="button" class="toggle-btn" data-mode="grayscale"
-          onclick="selectTestInputMode('grayscale')">Grayscale Image</button>
-  <button type="button" class="toggle-btn" data-mode="rgb"
-          onclick="selectTestInputMode('rgb')">RGB Image</button>
-</div>
-
-<input type="hidden" id="input-mode-field" name="input_mode" value="numeric">
-
-<!-- Numeric panel (default) -->
-<div id="test-panel-numeric" style="margin-top:16px">
-  {numeric_panel}
-</div>
-
-<!-- Grayscale panel (hidden until selected) -->
-<div id="test-panel-image" style="display:none;margin-top:16px">
-  {grayscale_panel_with_wh}
-</div>
-
-<!-- Draw panel (hidden until selected) -->
-<div id="test-panel-draw" style="display:none;margin-top:16px">
-  {draw_panel}
-</div>
-
-{canvas_js}
-{mode_js}"#,
-        numeric_panel        = numeric_textarea_html(),
-        grayscale_panel_with_wh = image_upload_html_with_wh_inputs("grayscale", 28, 28),
-        draw_panel           = canvas_draw_panel_html(),
-        canvas_js            = canvas_draw_js(),
-        mode_js              = select_mode_js(false),
-    )
-}
-
-/// Upload | Draw toggle for ImageGrayscale models (dimensions known from metadata).
-fn build_input_section_grayscale_known(width: u32, height: u32) -> String {
-    let hint = format!(
-        "Grayscale image — will be resized to {}x{} and normalized.",
-        width, height
-    );
-    format!(
-        r#"<div id="test-mode-group" class="toggle-group" style="margin-top:16px;margin-bottom:0">
-  <button type="button" class="toggle-btn active" data-mode="image"
-          onclick="selectTestInputMode('image')">Upload Image</button>
-  <button type="button" class="toggle-btn" data-mode="draw"
-          onclick="selectTestInputMode('draw')">Draw</button>
-</div>
-
-<input type="hidden" id="input-mode-field" name="input_mode" value="grayscale">
-<input type="hidden" name="input_width"  value="{w}">
-<input type="hidden" name="input_height" value="{h}">
-
-<!-- Upload panel (default) -->
-<div id="test-panel-image" style="margin-top:16px">
-  {upload_html}
-</div>
-
-<!-- Draw panel -->
-<div id="test-panel-draw" style="display:none;margin-top:16px">
-  {draw_panel}
-</div>
-
-{canvas_js}
-{mode_js}"#,
-        w            = width,
-        h            = height,
-        upload_html  = image_upload_html_no_wh(&hint),
-        draw_panel   = canvas_draw_panel_html(),
-        canvas_js    = canvas_draw_js(),
-        mode_js      = select_mode_js(true),
-    )
-}
-
-/// Upload only for ImageRgb models (no draw panel, dimensions pre-filled).
-fn build_input_section_rgb_known(width: u32, height: u32) -> String {
-    let hint = format!(
-        "RGB image — will be resized to {}x{} and normalized.",
-        width, height
-    );
-    format!(
-        r#"<input type="hidden" id="input-mode-field" name="input_mode" value="rgb">
-<input type="hidden" name="input_width"  value="{w}">
-<input type="hidden" name="input_height" value="{h}">
-
-<div style="margin-top:16px">
-  {upload_html}
-</div>"#,
-        w           = width,
-        h           = height,
-        upload_html = image_upload_html_no_wh(&hint),
-    )
-}
-
-/// Numeric textarea only (metadata explicitly says Numeric).
-fn build_input_section_numeric_only() -> String {
-    format!(
-        r#"<input type="hidden" id="input-mode-field" name="input_mode" value="numeric">
-
-<div style="margin-top:16px">
-  {numeric_panel}
-</div>"#,
-        numeric_panel = numeric_textarea_html(),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// HTML fragment helpers
-// ---------------------------------------------------------------------------
-
-fn numeric_textarea_html() -> &'static str {
-    r#"<label for="inputs">Input values</label>
-<textarea id="inputs" name="inputs" rows="4"
-  placeholder="Enter comma-separated numbers, e.g.:&#10;0.0, 1.0"></textarea>
-<p class="hint">Comma-separated floats — one value per input neuron.</p>"#
-}
-
-/// File upload widget + preview, with W and H number inputs for user-selected image mode.
-fn image_upload_html_with_wh_inputs(mode: &str, default_w: u32, default_h: u32) -> String {
-    format!(
-        r#"<div style="display:flex;gap:16px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap">
-  <div>
-    <label for="test-input-w-{mode}">Width (px)</label>
-    <input type="number" id="test-input-w-{mode}" name="input_width"
-           value="{w}" min="1" max="1024" style="width:70px">
-  </div>
-  <div>
-    <label for="test-input-h-{mode}">Height (px)</label>
-    <input type="number" id="test-input-h-{mode}" name="input_height"
-           value="{h}" min="1" max="1024" style="width:70px">
-  </div>
-</div>
-<label for="image_file">Upload image</label>
-<input type="file" id="image_file" name="image_file"
-       accept="image/png,image/jpeg,image/bmp,image/gif"
-       style="margin-bottom:10px">
-<div id="preview-wrap" style="display:none;margin-bottom:10px">
-  <img id="preview" style="max-width:140px;image-rendering:pixelated;border-radius:6px;border:1.5px solid #dde2ec">
-</div>
-<p class="hint">Image will be resized to the specified dimensions and normalized.</p>
-<script>
-document.getElementById('image_file').addEventListener('change', function() {{
-  var img = document.getElementById('preview');
-  img.src = URL.createObjectURL(this.files[0]);
-  document.getElementById('preview-wrap').style.display = 'block';
-}});
-</script>"#,
-        mode = mode,
-        w    = default_w,
-        h    = default_h,
-    )
-}
-
-/// File upload widget + preview, no W/H inputs (dimensions are hidden fields from metadata).
-fn image_upload_html_no_wh(hint: &str) -> String {
-    format!(
-        r#"<label for="image_file">Upload image</label>
-<input type="file" id="image_file" name="image_file"
-       accept="image/png,image/jpeg,image/bmp,image/gif"
-       style="margin-bottom:10px">
-<div id="preview-wrap" style="display:none;margin-bottom:10px">
-  <img id="preview" style="max-width:140px;image-rendering:pixelated;border-radius:6px;border:1.5px solid #dde2ec">
-</div>
-<p class="hint">{hint}</p>
-<script>
-document.getElementById('image_file').addEventListener('change', function() {{
-  var img = document.getElementById('preview');
-  img.src = URL.createObjectURL(this.files[0]);
-  document.getElementById('preview-wrap').style.display = 'block';
-}});
-</script>"#,
-        hint = hint,
-    )
-}
-
-fn canvas_draw_panel_html() -> &'static str {
-    r#"<canvas id="draw-canvas" width="280" height="280"
-        style="cursor:crosshair;border:2px solid #555;border-radius:6px;touch-action:none;display:block;margin-bottom:8px"></canvas>
-<button type="button" class="btn" onclick="clearCanvas()">Clear</button>
-<p class="hint">Draw your digit in white on the black canvas — the image will be sent as-is to the model.</p>"#
-}
-
-// ---------------------------------------------------------------------------
-// JavaScript helpers (injected inline by Rust)
-// ---------------------------------------------------------------------------
-
-fn canvas_draw_js() -> &'static str {
-    r#"<script>
-(function() {
-  var drawing = false;
-  var lastX = 0, lastY = 0;
-  var drawCanvas = document.getElementById('draw-canvas');
-  var drawCtx    = drawCanvas.getContext('2d');
-
-  // Initialize: black background, white brush.
-  drawCtx.fillStyle = '#000';
-  drawCtx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
-  drawCtx.strokeStyle = '#fff';
-  drawCtx.lineWidth = 14;
-  drawCtx.lineCap = 'round';
-  drawCtx.lineJoin = 'round';
-
-  function startDraw(x, y) { drawing = true; lastX = x; lastY = y; }
-  function moveDraw(x, y) {
-    if (!drawing) return;
-    drawCtx.beginPath();
-    drawCtx.moveTo(lastX, lastY);
-    drawCtx.lineTo(x, y);
-    drawCtx.stroke();
-    lastX = x; lastY = y;
-  }
-  function endDraw() { drawing = false; }
-
-  drawCanvas.addEventListener('mousedown', function(e) {
-    var r = drawCanvas.getBoundingClientRect();
-    startDraw(e.clientX - r.left, e.clientY - r.top);
-  });
-  drawCanvas.addEventListener('mousemove', function(e) {
-    var r = drawCanvas.getBoundingClientRect();
-    moveDraw(e.clientX - r.left, e.clientY - r.top);
-  });
-  drawCanvas.addEventListener('mouseup', endDraw);
-  drawCanvas.addEventListener('mouseleave', endDraw);
-
-  drawCanvas.addEventListener('touchstart', function(e) {
-    e.preventDefault();
-    var r = drawCanvas.getBoundingClientRect();
-    var t = e.touches[0];
-    startDraw(t.clientX - r.left, t.clientY - r.top);
-  }, { passive: false });
-  drawCanvas.addEventListener('touchmove', function(e) {
-    e.preventDefault();
-    var r = drawCanvas.getBoundingClientRect();
-    var t = e.touches[0];
-    moveDraw(t.clientX - r.left, t.clientY - r.top);
-  }, { passive: false });
-  drawCanvas.addEventListener('touchend', endDraw);
-
-  window.clearCanvas = function() {
-    drawCtx.fillStyle = '#000';
-    drawCtx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
-  };
-
-  // On form submit: if in draw mode, capture canvas as PNG and inject into file input.
-  document.getElementById('test-infer-form').addEventListener('submit', function(e) {
-    var modeField = document.getElementById('input-mode-field');
-    var mode = modeField ? modeField.value : '';
-    if (mode === 'grayscale' || mode === 'rgb') {
-      var drawPanel = document.getElementById('test-panel-draw');
-      if (drawPanel && drawPanel.style.display !== 'none') {
-        e.preventDefault();
-        drawCanvas.toBlob(function(blob) {
-          var file = new File([blob], 'drawing.png', { type: 'image/png' });
-          var dt = new DataTransfer();
-          dt.items.add(file);
-          document.getElementById('image_file').files = dt.files;
-          document.getElementById('test-infer-form').submit();
-        }, 'image/png');
-      }
-    }
-  });
-})();
-</script>"#
-}
-
-/// JS for the mode-toggle button group.
-/// `grayscale_only` = true means there are only two panels (image / draw) and
-/// the hidden `input_mode` field is always "grayscale" — clicking a panel toggle
-/// must NOT change the hidden field value.
-/// `grayscale_only` = false means the three-way selector where the hidden field
-/// value must change between "numeric", "grayscale", and "rgb".
-fn select_mode_js(grayscale_only: bool) -> String {
-    if grayscale_only {
-        // Two-panel toggle: Upload Image / Draw.
-        // The input_mode hidden field stays "grayscale"; we only swap visible panels.
-        r#"<script>
-function selectTestInputMode(mode) {
-  ['image', 'draw'].forEach(function(p) {
-    var el = document.getElementById('test-panel-' + p);
-    if (el) el.style.display = 'none';
-  });
-  var show = document.getElementById('test-panel-' + mode);
-  if (show) show.style.display = 'block';
-
-  document.querySelectorAll('#test-mode-group .toggle-btn').forEach(function(btn) {
-    btn.classList.toggle('active', btn.dataset.mode === mode);
-  });
-}
-</script>"#.to_owned()
-    } else {
-        // Three-way toggle: Numeric / Grayscale / RGB.
-        // The hidden field value tracks which mode is active.
-        // Width/height inputs live inside each panel so the correct one is submitted.
-        r#"<script>
-function selectTestInputMode(mode) {
-  document.getElementById('input-mode-field').value = mode;
-
-  ['numeric', 'image', 'draw'].forEach(function(p) {
-    var el = document.getElementById('test-panel-' + p);
-    if (el) el.style.display = 'none';
-  });
-
-  // Grayscale image panel → show upload; Draw panel is a separate entry point.
-  var panelId = (mode === 'grayscale') ? 'image' : mode;
-  var show = document.getElementById('test-panel-' + panelId);
-  if (show) show.style.display = 'block';
-
-  document.querySelectorAll('#test-mode-group .toggle-btn').forEach(function(btn) {
-    btn.classList.toggle('active', btn.dataset.mode === mode);
-  });
-}
-
-// Secondary Draw toggle for the no-metadata grayscale path.
-// Clicking "Draw" from the Grayscale Image panel:
-function openDrawPanel() {
-  document.getElementById('test-panel-image').style.display = 'none';
-  document.getElementById('test-panel-draw').style.display  = 'block';
-}
-function openUploadPanel() {
-  document.getElementById('test-panel-draw').style.display  = 'none';
-  document.getElementById('test-panel-image').style.display = 'block';
-}
-</script>"#.to_owned()
-    }
+    Some(ModelInfo {
+        name: name.to_owned(),
+        input_type,
+        output_labels,
+        input_size,
+        output_size,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Inference runners
 // ---------------------------------------------------------------------------
 
-fn run_inference_numeric(model_name: &str, raw_inputs: &str) -> String {
+fn run_infer_numeric(model_name: &str, raw_inputs: &str) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = match Network::load_json(&path) {
-        Ok(n)  => n,
-        Err(e) => return error_html(&format!("Could not load model <strong>{}</strong>: {}", html_escape(model_name), e)),
-    };
-    if network.layers.is_empty() { return error_html("Model has no layers."); }
+    let mut network = Network::load_json(&path)
+        .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
+
+    if network.layers.is_empty() {
+        return Err("Model has no layers.".into());
+    }
 
     let inputs: Vec<f64> = raw_inputs
         .split(',')
@@ -543,234 +276,139 @@ fn run_inference_numeric(model_name: &str, raw_inputs: &str) -> String {
         .filter_map(|s| s.parse::<f64>().ok())
         .collect();
 
-    let expected_len = network.input_size();
-    if inputs.len() != expected_len {
-        return error_html(&format!(
-            "Input length mismatch: model expects <strong>{}</strong> values, got <strong>{}</strong>.",
-            expected_len, inputs.len()
+    let expected = network.input_size();
+    if inputs.len() != expected {
+        return Err(format!(
+            "Input length mismatch: model expects {} values, got {}.",
+            expected, inputs.len()
         ));
     }
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
+    let activation = network.output_activation()
+        .cloned()
+        .unwrap_or(ActivationFunction::Identity);
+    Ok(format_infer_result(&output, labels, &activation))
 }
 
-fn run_inference_image_grayscale(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
+fn run_infer_grayscale(
+    model_name: &str,
+    image_bytes: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = match Network::load_json(&path) {
-        Ok(n)  => n,
-        Err(e) => return error_html(&format!("Could not load model <strong>{}</strong>: {}", html_escape(model_name), e)),
-    };
-    if network.layers.is_empty() { return error_html("Model has no layers."); }
+    let mut network = Network::load_json(&path)
+        .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
 
-    let inputs = match image_bytes_to_grayscale_input(image_bytes, width, height) {
-        Ok(v)  => v,
-        Err(e) => return error_html(&format!("Image decode error: {}", e)),
-    };
+    if network.layers.is_empty() {
+        return Err("Model has no layers.".into());
+    }
+
+    let inputs = image_bytes_to_grayscale_input(image_bytes, width, height)
+        .map_err(|e| format!("Image decode error: {}", e))?;
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
+    let activation = network.output_activation()
+        .cloned()
+        .unwrap_or(ActivationFunction::Identity);
+    Ok(format_infer_result(&output, labels, &activation))
 }
 
-fn run_inference_image_rgb(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
+fn run_infer_rgb(
+    model_name: &str,
+    image_bytes: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = match Network::load_json(&path) {
-        Ok(n)  => n,
-        Err(e) => return error_html(&format!("Could not load model <strong>{}</strong>: {}", html_escape(model_name), e)),
-    };
-    if network.layers.is_empty() { return error_html("Model has no layers."); }
+    let mut network = Network::load_json(&path)
+        .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
 
-    let inputs = match image_bytes_to_rgb_input(image_bytes, width, height) {
-        Ok(v)  => v,
-        Err(e) => return error_html(&format!("Image decode error: {}", e)),
-    };
+    if network.layers.is_empty() {
+        return Err("Model has no layers.".into());
+    }
+
+    let inputs = image_bytes_to_rgb_input(image_bytes, width, height)
+        .map_err(|e| format!("Image decode error: {}", e))?;
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
+    let activation = network.output_activation()
+        .cloned()
+        .unwrap_or(ActivationFunction::Identity);
+    Ok(format_infer_result(&output, labels, &activation))
 }
 
 // ---------------------------------------------------------------------------
 // Output formatters
 // ---------------------------------------------------------------------------
 
-fn format_output(output: &[f64], labels: Option<&[String]>, activator: &ActivationFunction) -> String {
-    match activator {
-        ActivationFunction::Softmax                         => format_softmax(output, labels),
-        ActivationFunction::Sigmoid if output.len() == 1   => format_sigmoid(output[0]),
-        _                                                   => format_raw(output),
+fn format_infer_result(
+    output: &[f64],
+    labels: Option<&[String]>,
+    activation: &ActivationFunction,
+) -> InferResult {
+    match activation {
+        ActivationFunction::Softmax => format_softmax(output, labels),
+        ActivationFunction::Sigmoid if output.len() == 1 => format_sigmoid(output[0]),
+        _ => format_raw(output),
     }
 }
 
-fn format_softmax(output: &[f64], labels: Option<&[String]>) -> String {
+fn format_softmax(output: &[f64], labels: Option<&[String]>) -> InferResult {
     let n = output.len();
-    let (best, best_conf) = output.iter().enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, &v)| (i, v))
-        .unwrap_or((0, 0.0));
 
     let label_for = |i: usize| -> String {
         labels.and_then(|l| l.get(i)).cloned().unwrap_or_else(|| i.to_string())
     };
 
-    let hero = label_for(best);
+    let (best, best_conf) = output.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, &v)| (i, v))
+        .unwrap_or((0, 0.0));
 
     let mut sorted: Vec<usize> = (0..n).collect();
     sorted.sort_by(|&a, &b| output[b].partial_cmp(&output[a]).unwrap());
 
-    let rows: String = sorted.iter().map(|&i| {
-        let pct   = output[i] * 100.0;
-        let width = (output[i] * 260.0) as u32;
-        let dim   = if i != best { " dim" } else { "" };
-        format!(
-            r#"<tr><td style="width:60px;font-weight:600;color:#333">{}</td><td><div class="bar-wrap"><div class="bar-fill{}" style="width:{}px"></div></div></td><td class="prob-pct">{:.1}%</td></tr>"#,
-            label_for(i), dim, width, pct
-        )
+    let all_scores: Vec<ScoreEntry> = sorted.iter().map(|&i| ScoreEntry {
+        label: label_for(i),
+        score: output[i],
     }).collect();
 
-    format!(
-        r#"<div class="result-card"><h2>Result</h2>
-<div class="prediction-hero">{hero}</div>
-<div class="prediction-sub">Confidence: {conf:.1}%</div>
-<table class="prob-table">
-  <thead><tr><th>Class</th><th>Confidence</th><th></th></tr></thead>
-  <tbody>{rows}</tbody>
-</table></div>"#,
-        hero = html_escape(&hero), conf = best_conf * 100.0, rows = rows
-    )
-}
-
-fn format_sigmoid(value: f64) -> String {
-    let pct   = value * 100.0;
-    let width = (value * 260.0) as u32;
-    format!(
-        r#"<div class="result-card"><h2>Result</h2>
-<div class="prediction-hero">{:.4}</div>
-<div class="prediction-sub">Output probability: {:.1}%</div>
-<div style="margin-top:14px"><div class="bar-wrap" style="width:100%;max-width:300px"><div class="bar-fill" style="width:{}px"></div></div></div>
-</div>"#,
-        value, pct, width
-    )
-}
-
-fn format_raw(output: &[f64]) -> String {
-    let values: String = output.iter().enumerate()
-        .map(|(i, v)| format!("[{}] {:.6}", i, v))
-        .collect::<Vec<_>>().join("<br>");
-    format!(
-        r#"<div class="result-card"><h2>Result</h2><div class="raw-output">{}</div></div>"#,
-        values
-    )
-}
-
-fn error_html(msg: &str) -> String {
-    format!(r#"<div class="result-card"><h2>Error</h2><div class="error-box">{}</div></div>"#, msg)
-}
-
-// ---------------------------------------------------------------------------
-// POST /test/import-model
-// ---------------------------------------------------------------------------
-
-pub fn handle_import_model(request: &mut Request, state: SharedState) -> Response<Cursor<Vec<u8>>> {
-    let st   = state.lock().unwrap();
-    let mask = st.tab_unlock_mask();
-    drop(st);
-
-    let content_type = request.headers().iter()
-        .find(|h| h.field.equiv("Content-Type"))
-        .map(|h| h.value.as_str().to_owned())
-        .unwrap_or_default();
-
-    let boundary = match extract_boundary(&content_type) {
-        Some(b) => b,
-        None    => {
-            let page = build_test_page("", &error_html("Invalid multipart request."), mask);
-            return crate::routes::html_response(page);
-        }
-    };
-
-    let mut body: Vec<u8> = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut body);
-
-    // Extract file bytes.
-    let file_bytes = match multipart_extract_file_by_name(&body, &boundary, "model_file") {
-        Some(b) if !b.is_empty() => b,
-        _ => {
-            let page = build_test_page("", &error_html("No JSON file was uploaded."), mask);
-            return crate::routes::html_response(page);
-        }
-    };
-
-    // Basic JSON validation: must deserialize and contain a "layers" key.
-    let json_val: serde_json::Value = match serde_json::from_slice(&file_bytes) {
-        Ok(v)  => v,
-        Err(_) => {
-            let page = build_test_page("", &error_html("Uploaded file is not valid JSON."), mask);
-            return crate::routes::html_response(page);
-        }
-    };
-    if json_val.get("layers").is_none() {
-        let page = build_test_page("", &error_html("JSON does not appear to be a Ferrite model (missing \"layers\" field)."), mask);
-        return crate::routes::html_response(page);
+    InferResult {
+        result_type: "softmax".into(),
+        prediction: Some(label_for(best)),
+        confidence: Some(best_conf),
+        all_scores,
+        raw_values: None,
     }
+}
 
-    // Extract the original filename from multipart headers.
-    let raw_filename = extract_upload_filename(&body, &boundary)
-        .unwrap_or_else(|| "imported_model".to_owned());
+fn format_sigmoid(value: f64) -> InferResult {
+    InferResult {
+        result_type: "sigmoid".into(),
+        prediction: Some(format!("{:.4}", value)),
+        confidence: Some(value),
+        all_scores: vec![
+            ScoreEntry { label: "output".into(), score: value },
+        ],
+        raw_values: Some(vec![value]),
+    }
+}
 
-    // Strip path components and .json extension, then sanitize.
-    let stem = std::path::Path::new(&raw_filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("imported_model");
-    let sanitized: String = stem
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+fn format_raw(output: &[f64]) -> InferResult {
+    let all_scores: Vec<ScoreEntry> = output.iter().enumerate()
+        .map(|(i, &v)| ScoreEntry { label: i.to_string(), score: v })
         .collect();
-    let model_name = if sanitized.is_empty() { "imported_model".to_owned() } else { sanitized };
 
-    // Write to trained_models/.
-    let model_dir  = "trained_models";
-    let model_path = format!("{}/{}.json", model_dir, model_name);
-    if let Err(_) = std::fs::create_dir_all(model_dir) {
-        let page = build_test_page("", &error_html("Could not create trained_models/ directory."), mask);
-        return crate::routes::html_response(page);
+    InferResult {
+        result_type: "raw".into(),
+        prediction: None,
+        confidence: None,
+        all_scores,
+        raw_values: Some(output.to_vec()),
     }
-    if let Err(_) = std::fs::write(&model_path, &file_bytes) {
-        let page = build_test_page("", &error_html(&format!("Could not write model to '{}'.", model_path)), mask);
-        return crate::routes::html_response(page);
-    }
-
-    // Redirect to /test?model=<name> so the new model is selected.
-    crate::routes::redirect(&format!("/test?model={}", model_name))
-}
-
-/// Extracts the `filename="..."` value from the first file part of a multipart body.
-fn extract_upload_filename(body: &[u8], boundary: &str) -> Option<String> {
-    let delimiter = format!("--{}", boundary);
-    let delim_bytes = delimiter.as_bytes();
-    let parts = split_on(body, delim_bytes);
-
-    for part in &parts {
-        let sep = b"\r\n\r\n";
-        if let Some(sep_pos) = find_subsequence(part, sep) {
-            let header_section = &part[..sep_pos];
-            let headers_str = String::from_utf8_lossy(header_section);
-            // Only file parts have filename=.
-            if !headers_str.contains("filename=") {
-                continue;
-            }
-            // Parse filename="..." or filename=...
-            let key = "filename=\"";
-            if let Some(pos) = headers_str.find(key) {
-                let rest = &headers_str[pos + key.len()..];
-                if let Some(end) = rest.find('"') {
-                    return Some(rest[..end].to_owned());
-                }
-            }
-        }
-    }
-    None
 }

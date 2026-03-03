@@ -5,7 +5,7 @@ use ferrite_nn::{ActivationFunction, InputType, Network};
 
 use crate::state::SharedState;
 use crate::util::form::{parse_form, form_get};
-use crate::util::multipart::{extract_boundary, multipart_extract_file, extract_text_field,
+use crate::util::multipart::{extract_boundary, multipart_extract_file_by_name, extract_text_field,
                               find_subsequence, split_on};
 use crate::util::image::{image_bytes_to_grayscale_input, image_bytes_to_rgb_input};
 use crate::render::{render_page, Page};
@@ -41,29 +41,48 @@ pub fn handle_infer(request: &mut Request, state: SharedState) -> Response<Curso
         .map(|h| h.value.as_str().to_owned())
         .unwrap_or_default();
 
-    let is_multipart = content_type.starts_with("multipart/form-data");
+    let boundary = extract_boundary(&content_type).unwrap_or_default();
 
-    let (model_name, result_html) = if is_multipart {
-        let mut body_bytes: Vec<u8> = Vec::new();
-        let _ = request.as_reader().read_to_end(&mut body_bytes);
-        let boundary = extract_boundary(&content_type).unwrap_or_default();
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body_bytes);
 
-        let model_name = extract_text_field(&body_bytes, &boundary, "model")
-            .unwrap_or_default();
+    let model_name = extract_text_field(&body_bytes, &boundary, "model")
+        .unwrap_or_default();
 
-        let result = match multipart_extract_file(&body_bytes, &boundary) {
-            Some(bytes) if !bytes.is_empty() => run_inference_image(&model_name, &bytes),
-            _ => error_html("No image file was uploaded."),
-        };
-        (model_name, result)
-    } else {
-        let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
-        let pairs      = parse_form(&body);
-        let model_name = form_get(&pairs, "model").unwrap_or("").to_owned();
-        let raw_inputs = form_get(&pairs, "inputs").unwrap_or("").to_owned();
-        let result     = run_inference_numeric(&model_name, &raw_inputs);
-        (model_name, result)
+    let input_mode = extract_text_field(&body_bytes, &boundary, "input_mode")
+        .unwrap_or_else(|| "numeric".to_string());
+
+    let width: u32 = extract_text_field(&body_bytes, &boundary, "input_width")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(28);
+
+    let height: u32 = extract_text_field(&body_bytes, &boundary, "input_height")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(28);
+
+    let result_html = match input_mode.as_str() {
+        "grayscale" => {
+            match multipart_extract_file_by_name(&body_bytes, &boundary, "image_file") {
+                Some(bytes) if !bytes.is_empty() => {
+                    run_inference_image_grayscale(&model_name, &bytes, width, height)
+                }
+                _ => error_html("No image file was uploaded."),
+            }
+        }
+        "rgb" => {
+            match multipart_extract_file_by_name(&body_bytes, &boundary, "image_file") {
+                Some(bytes) if !bytes.is_empty() => {
+                    run_inference_image_rgb(&model_name, &bytes, width, height)
+                }
+                _ => error_html("No image file was uploaded."),
+            }
+        }
+        _ => {
+            // numeric: textarea value arrives as a multipart text field named "inputs"
+            let raw_inputs = extract_text_field(&body_bytes, &boundary, "inputs")
+                .unwrap_or_default();
+            run_inference_numeric(&model_name, &raw_inputs)
+        }
     };
 
     let page = build_test_page(&model_name, &result_html, mask);
@@ -77,17 +96,17 @@ pub fn handle_infer(request: &mut Request, state: SharedState) -> Response<Curso
 fn build_test_page(selected: &str, result_html: &str, tab_unlock: u8) -> String {
     let models = list_models();
     let model_options = build_model_options(&models, selected);
-    let (form_enctype, input_section) = build_input_section(selected);
+    let input_section = build_input_section(selected);
 
+    // The form always uses multipart so all three input modes work uniformly.
     let full_input_section = format!(
-        r#"<form method="POST" action="/test/infer" enctype="{enctype}" style="margin-top:18px">
+        r#"<form method="POST" action="/test/infer" enctype="multipart/form-data" id="test-infer-form" style="margin-top:18px">
   <input type="hidden" name="model" value="{model}">
   {input}
   <div class="mt"><button type="submit" class="btn btn-primary">Run Inference</button></div>
 </form>"#,
-        enctype = form_enctype,
-        model   = html_escape(selected),
-        input   = input_section,
+        model = html_escape(selected),
+        input = input_section,
     );
 
     render_page(Page::Test, tab_unlock, false, |tmpl| {
@@ -134,37 +153,211 @@ fn build_model_options(models: &[String], selected: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Input section (based on model metadata)
+// Input section — dispatches on model metadata
 // ---------------------------------------------------------------------------
 
-fn build_input_section(model_name: &str) -> (&'static str, String) {
+fn build_input_section(model_name: &str) -> String {
     if model_name.is_empty() {
-        return numeric_section();
+        // No model selected yet — show numeric textarea as a sensible default.
+        return build_input_section_no_metadata();
     }
+
     let path = format!("trained_models/{}.json", model_name);
     let network = Network::load_json(&path).ok();
     let input_type = network.as_ref()
         .and_then(|n| n.metadata.as_ref())
-        .and_then(|m| m.input_type.as_ref());
+        .and_then(|m| m.input_type.as_ref())
+        .cloned();
 
     match input_type {
         Some(InputType::ImageGrayscale { width, height }) => {
-            image_section(*width, *height, "Grayscale")
+            // Metadata fully specifies: Upload | Draw toggle.
+            build_input_section_grayscale_known(width, height)
         }
         Some(InputType::ImageRgb { width, height }) => {
-            image_section(*width, *height, "RGB")
+            // Metadata fully specifies: Upload only.
+            build_input_section_rgb_known(width, height)
         }
-        _ => numeric_section(),
+        Some(InputType::Numeric) => {
+            // Metadata says numeric — textarea only, no toggle.
+            build_input_section_numeric_only()
+        }
+        None => {
+            // No metadata: three-way selector so user picks the mode.
+            build_input_section_no_metadata()
+        }
     }
 }
 
-fn image_section(width: u32, height: u32, color_mode: &str) -> (&'static str, String) {
-    let hint = format!("{} image — will be resized to {}x{} and normalized.", color_mode, width, height);
-    (
-        "multipart/form-data",
-        format!(
-            r#"<label for="image_file">Upload image</label>
-<input type="file" id="image_file" name="image_file" accept="image/png,image/jpeg,image/bmp,image/gif" style="margin-bottom:10px">
+// ---------------------------------------------------------------------------
+// Input section variants
+// ---------------------------------------------------------------------------
+
+/// Three-way selector: Numeric (default) | Grayscale Image | RGB Image.
+/// Used when `metadata.input_type` is `None`.
+fn build_input_section_no_metadata() -> String {
+    format!(
+        r#"<div id="test-mode-group" class="toggle-group" style="margin-top:16px;margin-bottom:0">
+  <button type="button" class="toggle-btn active" data-mode="numeric"
+          onclick="selectTestInputMode('numeric')">Numeric</button>
+  <button type="button" class="toggle-btn" data-mode="grayscale"
+          onclick="selectTestInputMode('grayscale')">Grayscale Image</button>
+  <button type="button" class="toggle-btn" data-mode="rgb"
+          onclick="selectTestInputMode('rgb')">RGB Image</button>
+</div>
+
+<input type="hidden" id="input-mode-field" name="input_mode" value="numeric">
+
+<!-- Numeric panel (default) -->
+<div id="test-panel-numeric" style="margin-top:16px">
+  {numeric_panel}
+</div>
+
+<!-- Grayscale panel (hidden until selected) -->
+<div id="test-panel-image" style="display:none;margin-top:16px">
+  {grayscale_panel_with_wh}
+</div>
+
+<!-- Draw panel (hidden until selected) -->
+<div id="test-panel-draw" style="display:none;margin-top:16px">
+  {draw_panel}
+</div>
+
+{canvas_js}
+{mode_js}"#,
+        numeric_panel        = numeric_textarea_html(),
+        grayscale_panel_with_wh = image_upload_html_with_wh_inputs("grayscale", 28, 28),
+        draw_panel           = canvas_draw_panel_html(),
+        canvas_js            = canvas_draw_js(),
+        mode_js              = select_mode_js(false),
+    )
+}
+
+/// Upload | Draw toggle for ImageGrayscale models (dimensions known from metadata).
+fn build_input_section_grayscale_known(width: u32, height: u32) -> String {
+    let hint = format!(
+        "Grayscale image — will be resized to {}x{} and normalized.",
+        width, height
+    );
+    format!(
+        r#"<div id="test-mode-group" class="toggle-group" style="margin-top:16px;margin-bottom:0">
+  <button type="button" class="toggle-btn active" data-mode="image"
+          onclick="selectTestInputMode('image')">Upload Image</button>
+  <button type="button" class="toggle-btn" data-mode="draw"
+          onclick="selectTestInputMode('draw')">Draw</button>
+</div>
+
+<input type="hidden" id="input-mode-field" name="input_mode" value="grayscale">
+<input type="hidden" name="input_width"  value="{w}">
+<input type="hidden" name="input_height" value="{h}">
+
+<!-- Upload panel (default) -->
+<div id="test-panel-image" style="margin-top:16px">
+  {upload_html}
+</div>
+
+<!-- Draw panel -->
+<div id="test-panel-draw" style="display:none;margin-top:16px">
+  {draw_panel}
+</div>
+
+{canvas_js}
+{mode_js}"#,
+        w            = width,
+        h            = height,
+        upload_html  = image_upload_html_no_wh(&hint),
+        draw_panel   = canvas_draw_panel_html(),
+        canvas_js    = canvas_draw_js(),
+        mode_js      = select_mode_js(true),
+    )
+}
+
+/// Upload only for ImageRgb models (no draw panel, dimensions pre-filled).
+fn build_input_section_rgb_known(width: u32, height: u32) -> String {
+    let hint = format!(
+        "RGB image — will be resized to {}x{} and normalized.",
+        width, height
+    );
+    format!(
+        r#"<input type="hidden" id="input-mode-field" name="input_mode" value="rgb">
+<input type="hidden" name="input_width"  value="{w}">
+<input type="hidden" name="input_height" value="{h}">
+
+<div style="margin-top:16px">
+  {upload_html}
+</div>"#,
+        w           = width,
+        h           = height,
+        upload_html = image_upload_html_no_wh(&hint),
+    )
+}
+
+/// Numeric textarea only (metadata explicitly says Numeric).
+fn build_input_section_numeric_only() -> String {
+    format!(
+        r#"<input type="hidden" id="input-mode-field" name="input_mode" value="numeric">
+
+<div style="margin-top:16px">
+  {numeric_panel}
+</div>"#,
+        numeric_panel = numeric_textarea_html(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// HTML fragment helpers
+// ---------------------------------------------------------------------------
+
+fn numeric_textarea_html() -> &'static str {
+    r#"<label for="inputs">Input values</label>
+<textarea id="inputs" name="inputs" rows="4"
+  placeholder="Enter comma-separated numbers, e.g.:&#10;0.0, 1.0"></textarea>
+<p class="hint">Comma-separated floats — one value per input neuron.</p>"#
+}
+
+/// File upload widget + preview, with W and H number inputs for user-selected image mode.
+fn image_upload_html_with_wh_inputs(mode: &str, default_w: u32, default_h: u32) -> String {
+    format!(
+        r#"<div style="display:flex;gap:16px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap">
+  <div>
+    <label for="test-input-w-{mode}">Width (px)</label>
+    <input type="number" id="test-input-w-{mode}" name="input_width"
+           value="{w}" min="1" max="1024" style="width:70px">
+  </div>
+  <div>
+    <label for="test-input-h-{mode}">Height (px)</label>
+    <input type="number" id="test-input-h-{mode}" name="input_height"
+           value="{h}" min="1" max="1024" style="width:70px">
+  </div>
+</div>
+<label for="image_file">Upload image</label>
+<input type="file" id="image_file" name="image_file"
+       accept="image/png,image/jpeg,image/bmp,image/gif"
+       style="margin-bottom:10px">
+<div id="preview-wrap" style="display:none;margin-bottom:10px">
+  <img id="preview" style="max-width:140px;image-rendering:pixelated;border-radius:6px;border:1.5px solid #dde2ec">
+</div>
+<p class="hint">Image will be resized to the specified dimensions and normalized.</p>
+<script>
+document.getElementById('image_file').addEventListener('change', function() {{
+  var img = document.getElementById('preview');
+  img.src = URL.createObjectURL(this.files[0]);
+  document.getElementById('preview-wrap').style.display = 'block';
+}});
+</script>"#,
+        mode = mode,
+        w    = default_w,
+        h    = default_h,
+    )
+}
+
+/// File upload widget + preview, no W/H inputs (dimensions are hidden fields from metadata).
+fn image_upload_html_no_wh(hint: &str) -> String {
+    format!(
+        r#"<label for="image_file">Upload image</label>
+<input type="file" id="image_file" name="image_file"
+       accept="image/png,image/jpeg,image/bmp,image/gif"
+       style="margin-bottom:10px">
 <div id="preview-wrap" style="display:none;margin-bottom:10px">
   <img id="preview" style="max-width:140px;image-rendering:pixelated;border-radius:6px;border:1.5px solid #dde2ec">
 </div>
@@ -176,19 +369,159 @@ document.getElementById('image_file').addEventListener('change', function() {{
   document.getElementById('preview-wrap').style.display = 'block';
 }});
 </script>"#,
-            hint = hint
-        ),
+        hint = hint,
     )
 }
 
-fn numeric_section() -> (&'static str, String) {
-    (
-        "application/x-www-form-urlencoded",
-        r#"<label for="inputs">Input values</label>
-<textarea id="inputs" name="inputs" rows="4"
-  placeholder="Enter comma-separated numbers, e.g.:&#10;0.0, 1.0"></textarea>
-<p class="hint">Comma-separated floats — one value per input neuron.</p>"#.to_owned(),
-    )
+fn canvas_draw_panel_html() -> &'static str {
+    r#"<canvas id="draw-canvas" width="280" height="280"
+        style="cursor:crosshair;border:2px solid #555;border-radius:6px;touch-action:none;display:block;margin-bottom:8px"></canvas>
+<button type="button" class="btn" onclick="clearCanvas()">Clear</button>
+<p class="hint">Draw your digit in white on the black canvas — the image will be sent as-is to the model.</p>"#
+}
+
+// ---------------------------------------------------------------------------
+// JavaScript helpers (injected inline by Rust)
+// ---------------------------------------------------------------------------
+
+fn canvas_draw_js() -> &'static str {
+    r#"<script>
+(function() {
+  var drawing = false;
+  var lastX = 0, lastY = 0;
+  var drawCanvas = document.getElementById('draw-canvas');
+  var drawCtx    = drawCanvas.getContext('2d');
+
+  // Initialize: black background, white brush.
+  drawCtx.fillStyle = '#000';
+  drawCtx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
+  drawCtx.strokeStyle = '#fff';
+  drawCtx.lineWidth = 14;
+  drawCtx.lineCap = 'round';
+  drawCtx.lineJoin = 'round';
+
+  function startDraw(x, y) { drawing = true; lastX = x; lastY = y; }
+  function moveDraw(x, y) {
+    if (!drawing) return;
+    drawCtx.beginPath();
+    drawCtx.moveTo(lastX, lastY);
+    drawCtx.lineTo(x, y);
+    drawCtx.stroke();
+    lastX = x; lastY = y;
+  }
+  function endDraw() { drawing = false; }
+
+  drawCanvas.addEventListener('mousedown', function(e) {
+    var r = drawCanvas.getBoundingClientRect();
+    startDraw(e.clientX - r.left, e.clientY - r.top);
+  });
+  drawCanvas.addEventListener('mousemove', function(e) {
+    var r = drawCanvas.getBoundingClientRect();
+    moveDraw(e.clientX - r.left, e.clientY - r.top);
+  });
+  drawCanvas.addEventListener('mouseup', endDraw);
+  drawCanvas.addEventListener('mouseleave', endDraw);
+
+  drawCanvas.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    var r = drawCanvas.getBoundingClientRect();
+    var t = e.touches[0];
+    startDraw(t.clientX - r.left, t.clientY - r.top);
+  }, { passive: false });
+  drawCanvas.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    var r = drawCanvas.getBoundingClientRect();
+    var t = e.touches[0];
+    moveDraw(t.clientX - r.left, t.clientY - r.top);
+  }, { passive: false });
+  drawCanvas.addEventListener('touchend', endDraw);
+
+  window.clearCanvas = function() {
+    drawCtx.fillStyle = '#000';
+    drawCtx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
+  };
+
+  // On form submit: if in draw mode, capture canvas as PNG and inject into file input.
+  document.getElementById('test-infer-form').addEventListener('submit', function(e) {
+    var modeField = document.getElementById('input-mode-field');
+    var mode = modeField ? modeField.value : '';
+    if (mode === 'grayscale' || mode === 'rgb') {
+      var drawPanel = document.getElementById('test-panel-draw');
+      if (drawPanel && drawPanel.style.display !== 'none') {
+        e.preventDefault();
+        drawCanvas.toBlob(function(blob) {
+          var file = new File([blob], 'drawing.png', { type: 'image/png' });
+          var dt = new DataTransfer();
+          dt.items.add(file);
+          document.getElementById('image_file').files = dt.files;
+          document.getElementById('test-infer-form').submit();
+        }, 'image/png');
+      }
+    }
+  });
+})();
+</script>"#
+}
+
+/// JS for the mode-toggle button group.
+/// `grayscale_only` = true means there are only two panels (image / draw) and
+/// the hidden `input_mode` field is always "grayscale" — clicking a panel toggle
+/// must NOT change the hidden field value.
+/// `grayscale_only` = false means the three-way selector where the hidden field
+/// value must change between "numeric", "grayscale", and "rgb".
+fn select_mode_js(grayscale_only: bool) -> String {
+    if grayscale_only {
+        // Two-panel toggle: Upload Image / Draw.
+        // The input_mode hidden field stays "grayscale"; we only swap visible panels.
+        r#"<script>
+function selectTestInputMode(mode) {
+  ['image', 'draw'].forEach(function(p) {
+    var el = document.getElementById('test-panel-' + p);
+    if (el) el.style.display = 'none';
+  });
+  var show = document.getElementById('test-panel-' + mode);
+  if (show) show.style.display = 'block';
+
+  document.querySelectorAll('#test-mode-group .toggle-btn').forEach(function(btn) {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+}
+</script>"#.to_owned()
+    } else {
+        // Three-way toggle: Numeric / Grayscale / RGB.
+        // The hidden field value tracks which mode is active.
+        // Width/height inputs live inside each panel so the correct one is submitted.
+        r#"<script>
+function selectTestInputMode(mode) {
+  document.getElementById('input-mode-field').value = mode;
+
+  ['numeric', 'image', 'draw'].forEach(function(p) {
+    var el = document.getElementById('test-panel-' + p);
+    if (el) el.style.display = 'none';
+  });
+
+  // Grayscale image panel → show upload; Draw panel is a separate entry point.
+  var panelId = (mode === 'grayscale') ? 'image' : mode;
+  var show = document.getElementById('test-panel-' + panelId);
+  if (show) show.style.display = 'block';
+
+  document.querySelectorAll('#test-mode-group .toggle-btn').forEach(function(btn) {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+}
+
+// Secondary Draw toggle for the no-metadata grayscale path.
+// Clicking "Draw" from the Grayscale Image panel:
+function openDrawPanel() {
+  document.getElementById('test-panel-image').style.display = 'none';
+  document.getElementById('test-panel-draw').style.display  = 'block';
+}
+function openUploadPanel() {
+  document.getElementById('test-panel-draw').style.display  = 'none';
+  document.getElementById('test-panel-image').style.display = 'block';
+}
+</script>"#.to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +556,7 @@ fn run_inference_numeric(model_name: &str, raw_inputs: &str) -> String {
     format_output(&output, labels, &network.layers.last().unwrap().activator)
 }
 
-fn run_inference_image(model_name: &str, image_bytes: &[u8]) -> String {
+fn run_inference_image_grayscale(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
     let path = format!("trained_models/{}.json", model_name);
     let mut network = match Network::load_json(&path) {
         Ok(n)  => n,
@@ -231,22 +564,27 @@ fn run_inference_image(model_name: &str, image_bytes: &[u8]) -> String {
     };
     if network.layers.is_empty() { return error_html("Model has no layers."); }
 
-    let input_type = network.metadata.as_ref().and_then(|m| m.input_type.as_ref()).cloned();
+    let inputs = match image_bytes_to_grayscale_input(image_bytes, width, height) {
+        Ok(v)  => v,
+        Err(e) => return error_html(&format!("Image decode error: {}", e)),
+    };
 
-    let inputs = match &input_type {
-        Some(InputType::ImageGrayscale { width, height }) => {
-            match image_bytes_to_grayscale_input(image_bytes, *width, *height) {
-                Ok(v)  => v,
-                Err(e) => return error_html(&format!("Image decode error: {}", e)),
-            }
-        }
-        Some(InputType::ImageRgb { width, height }) => {
-            match image_bytes_to_rgb_input(image_bytes, *width, *height) {
-                Ok(v)  => v,
-                Err(e) => return error_html(&format!("Image decode error: {}", e)),
-            }
-        }
-        _ => return error_html("Model does not declare an image input type."),
+    let output = network.forward(inputs);
+    let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
+    format_output(&output, labels, &network.layers.last().unwrap().activator)
+}
+
+fn run_inference_image_rgb(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
+    let path = format!("trained_models/{}.json", model_name);
+    let mut network = match Network::load_json(&path) {
+        Ok(n)  => n,
+        Err(e) => return error_html(&format!("Could not load model <strong>{}</strong>: {}", html_escape(model_name), e)),
+    };
+    if network.layers.is_empty() { return error_html("Model has no layers."); }
+
+    let inputs = match image_bytes_to_rgb_input(image_bytes, width, height) {
+        Ok(v)  => v,
+        Err(e) => return error_html(&format!("Image decode error: {}", e)),
     };
 
     let output = network.forward(inputs);
@@ -357,7 +695,7 @@ pub fn handle_import_model(request: &mut Request, state: SharedState) -> Respons
     let _ = request.as_reader().read_to_end(&mut body);
 
     // Extract file bytes.
-    let file_bytes = match multipart_extract_file(&body, &boundary) {
+    let file_bytes = match multipart_extract_file_by_name(&body, &boundary, "model_file") {
         Some(b) if !b.is_empty() => b,
         _ => {
             let page = build_test_page("", &error_html("No JSON file was uploaded."), mask);

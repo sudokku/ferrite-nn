@@ -10,7 +10,7 @@
 /// placeholders that were not replaced by the closure are blanked to avoid
 /// leaking raw `{{TOKEN}}` strings to the browser.
 
-const TEMPLATE: &str = include_str!("assets/studio.html");
+const TEMPLATE: &str = include_str!("../assets/studio.html");
 
 /// Which tab is active — controls both the active CSS class and the JS
 /// `ACTIVE_TAB` variable injected into the page.

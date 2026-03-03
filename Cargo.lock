@@ -78,6 +78,16 @@ dependencies = [
 name = "ferrite-nn"
 version = "0.1.0"
 dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ferrite-studio"
+version = "0.1.0"
+dependencies = [
+ "ferrite-nn",
  "image",
  "rand",
  "serde",

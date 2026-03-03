@@ -1,5 +1,5 @@
 /target
-/trained_models/
+trained_models/
 .DS_Store
 **/.DS_Store
 examples/mnist_data/

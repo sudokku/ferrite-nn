@@ -44,6 +44,17 @@ impl Network {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
+    /// Returns the number of input neurons the network expects.
+    /// This is the column count of the first layer's weight matrix.
+    pub fn input_size(&self) -> usize {
+        self.layers.first().map(|l| l.weights.cols).unwrap_or(0)
+    }
+
+    /// Returns a reference to the output layer's activation function.
+    pub fn output_activation(&self) -> Option<&ActivationFunction> {
+        self.layers.last().map(|l| &l.activator)
+    }
+
     /// Builds a fresh (randomly initialized) `Network` from a `NetworkSpec`.
     ///
     /// Weight initialization follows `Layer::new` conventions:

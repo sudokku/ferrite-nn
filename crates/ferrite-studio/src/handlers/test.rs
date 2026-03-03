@@ -543,7 +543,7 @@ fn run_inference_numeric(model_name: &str, raw_inputs: &str) -> String {
         .filter_map(|s| s.parse::<f64>().ok())
         .collect();
 
-    let expected_len = network.layers[0].weights.cols;
+    let expected_len = network.input_size();
     if inputs.len() != expected_len {
         return error_html(&format!(
             "Input length mismatch: model expects <strong>{}</strong> values, got <strong>{}</strong>.",
@@ -553,7 +553,7 @@ fn run_inference_numeric(model_name: &str, raw_inputs: &str) -> String {
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, &network.layers.last().unwrap().activator)
+    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
 }
 
 fn run_inference_image_grayscale(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
@@ -571,7 +571,7 @@ fn run_inference_image_grayscale(model_name: &str, image_bytes: &[u8], width: u3
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, &network.layers.last().unwrap().activator)
+    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
 }
 
 fn run_inference_image_rgb(model_name: &str, image_bytes: &[u8], width: u32, height: u32) -> String {
@@ -589,7 +589,7 @@ fn run_inference_image_rgb(model_name: &str, image_bytes: &[u8], width: u32, hei
 
     let output = network.forward(inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
-    format_output(&output, labels, &network.layers.last().unwrap().activator)
+    format_output(&output, labels, network.output_activation().unwrap_or(&ActivationFunction::Identity))
 }
 
 // ---------------------------------------------------------------------------

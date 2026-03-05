@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use axum::{Router, routing::{get, post}};
+use axum::{Router, routing::{get, post}, extract::DefaultBodyLimit};
 use crate::state::StudioState;
 
 /// Shared state passed to every handler via axum's `State` extractor.
@@ -31,5 +31,6 @@ pub fn build_router(state: SharedState) -> Router {
         // Model management
         .route("/api/models",                 get(crate::handlers::models::handle_list))
         .route("/api/models/:name/download",  get(crate::handlers::models::handle_download))
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200 MB — allows MNIST-sized IDX uploads
         .with_state(state)
 }

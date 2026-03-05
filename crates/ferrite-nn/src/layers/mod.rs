@@ -1,3 +1,3 @@
 pub mod dense;
 
-pub use dense::Layer;
+pub use dense::{Layer, LayerCache, ForwardCache};

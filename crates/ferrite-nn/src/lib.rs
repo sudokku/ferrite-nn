@@ -9,7 +9,7 @@ pub mod train;
 // Convenience re-exports
 pub use math::matrix::Matrix;
 pub use activation::activation::ActivationFunction;
-pub use layers::dense::Layer;
+pub use layers::dense::{Layer, LayerCache, ForwardCache};
 pub use network::network::Network;
 pub use network::metadata::{ModelMetadata, InputType};
 pub use network::spec::{NetworkSpec, LayerSpec};

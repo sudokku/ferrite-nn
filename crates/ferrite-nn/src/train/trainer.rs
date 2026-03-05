@@ -6,7 +6,7 @@ use crate::{
     optim::sgd::Sgd,
 };
 
-/// Trains the network for one epoch using mini-batch SGD.
+/// Trains the network for one epoch using mini-batch SGD and MSE loss.
 ///
 /// # Arguments
 /// * `network`          — the network to train (mutated in place)
@@ -17,7 +17,7 @@ use crate::{
 ///                        online (sample-by-sample) SGD
 ///
 /// # Returns
-/// Mean loss over all samples in the epoch.
+/// Mean MSE loss over all samples in the epoch.
 pub fn train_network(
     network: &mut Network,
     inputs: &[Vec<f64>],
@@ -26,7 +26,11 @@ pub fn train_network(
     batch_size: usize,
 ) -> f64 {
     assert!(!inputs.is_empty(), "inputs must not be empty");
-    assert_eq!(inputs.len(), expected_outputs.len(), "inputs and expected_outputs must have equal length");
+    assert_eq!(
+        inputs.len(),
+        expected_outputs.len(),
+        "inputs and expected_outputs must have equal length"
+    );
     assert!(batch_size > 0, "batch_size must be at least 1");
 
     let n = inputs.len();
@@ -43,7 +47,9 @@ pub fn train_network(
 
         // Initialize accumulated gradient storage: one (w_grad, b_grad) pair
         // per layer, all zeros with the correct shapes.
-        let mut acc_grads: Vec<(Matrix, Matrix)> = network.layers.iter()
+        let mut acc_grads: Vec<(Matrix, Matrix)> = network
+            .layers
+            .iter()
             .map(|layer| {
                 (
                     Matrix::zeros(layer.weights.rows, layer.weights.cols),
@@ -57,8 +63,8 @@ pub fn train_network(
             let input = &inputs[idx];
             let expected = &expected_outputs[idx];
 
-            // Forward pass — stores activations in each layer.
-            let output = network.forward(input.clone());
+            // Forward pass — stateless; caches returned explicitly.
+            let (output, cache) = network.forward_with_cache(input);
 
             // Accumulate loss (for reporting).
             total_loss += MseLoss::loss(&output, expected);
@@ -72,12 +78,14 @@ pub fn train_network(
                 let input_for_layer = if i == 0 {
                     Matrix::from_data(vec![input.clone()])
                 } else {
-                    network.layers[i - 1].neurons.clone()
+                    // Use cached post-activation of previous layer.
+                    Matrix::from_data(vec![cache[i - 1].post_activation.clone()])
                 };
 
                 let (w_grad, b_grad) = network.layers[i].compute_gradients(
                     delta.clone(),
                     &input_for_layer,
+                    &cache[i].pre_activation,
                 );
 
                 if i > 0 {
@@ -85,9 +93,9 @@ pub fn train_network(
                     delta = b_grad.clone() * network.layers[i].weights.transpose();
                 }
 
-                // Accumulate: acc += grad  (element-wise addition)
-                acc_grads[i].0 = acc_grads[i].0.clone() + w_grad;
-                acc_grads[i].1 = acc_grads[i].1.clone() + b_grad;
+                // In-place accumulation via AddAssign.
+                acc_grads[i].0 += w_grad;
+                acc_grads[i].1 += b_grad;
             }
         }
 

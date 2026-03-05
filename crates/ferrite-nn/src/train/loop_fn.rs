@@ -3,12 +3,12 @@ use std::time::Instant;
 
 use rand::seq::SliceRandom;
 
-use crate::loss::loss_type::LossType;
-use crate::loss::mse::MseLoss;
-use crate::loss::cross_entropy::CrossEntropyLoss;
 use crate::loss::bce::BceLoss;
-use crate::loss::mae::MaeLoss;
+use crate::loss::cross_entropy::CrossEntropyLoss;
 use crate::loss::huber::HuberLoss;
+use crate::loss::loss_type::LossType;
+use crate::loss::mae::MaeLoss;
+use crate::loss::mse::MseLoss;
 use crate::math::matrix::Matrix;
 use crate::network::network::Network;
 use crate::optim::sgd::Sgd;
@@ -82,18 +82,24 @@ pub fn train_loop(
 
         // ── Accuracy ──────────────────────────────────────────────────────
         let train_accuracy = match config.loss_type {
-            LossType::CrossEntropy       => Some(compute_accuracy_multiclass(network, train_inputs, train_labels)),
-            LossType::BinaryCrossEntropy => Some(compute_accuracy_binary(network, train_inputs, train_labels)),
-            _                            => None,
+            LossType::CrossEntropy => {
+                Some(compute_accuracy_multiclass(network, train_inputs, train_labels))
+            }
+            LossType::BinaryCrossEntropy => {
+                Some(compute_accuracy_binary(network, train_inputs, train_labels))
+            }
+            _ => None,
         };
 
         // ── Validation ────────────────────────────────────────────────────
         let (val_loss, val_accuracy) = if let (Some(vi), Some(vl)) = (val_inputs, val_labels) {
             let vl_val = compute_eval_loss(network, vi, vl, config.loss_type);
             let va = match config.loss_type {
-                LossType::CrossEntropy       => Some(compute_accuracy_multiclass(network, vi, vl)),
+                LossType::CrossEntropy => {
+                    Some(compute_accuracy_multiclass(network, vi, vl))
+                }
                 LossType::BinaryCrossEntropy => Some(compute_accuracy_binary(network, vi, vl)),
-                _                            => None,
+                _ => None,
             };
             (Some(vl_val), va)
         } else {
@@ -155,44 +161,52 @@ fn run_one_epoch(
         let actual_batch_size = (batch_end - batch_start) as f64;
 
         // Zero-initialize accumulated gradient storage.
-        let mut acc_grads: Vec<(Matrix, Matrix)> = network.layers.iter()
-            .map(|layer| (
-                Matrix::zeros(layer.weights.rows, layer.weights.cols),
-                Matrix::zeros(layer.biases.rows, layer.biases.cols),
-            ))
+        let mut acc_grads: Vec<(Matrix, Matrix)> = network
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    Matrix::zeros(layer.weights.rows, layer.weights.cols),
+                    Matrix::zeros(layer.biases.rows, layer.biases.cols),
+                )
+            })
             .collect();
 
         // Accumulate gradients over the mini-batch.
         for &idx in &indices[batch_start..batch_end] {
-            let input    = &inputs[idx];
+            let input = &inputs[idx];
             let expected = &labels[idx];
 
-            let output = network.forward(input.clone());
+            // Forward pass — stateless; caches returned explicitly.
+            let (output, cache) = network.forward_with_cache(input);
 
             total_loss += compute_loss(&output, expected, loss_type);
 
-            let error  = compute_loss_derivative(&output, expected, loss_type);
+            let error = compute_loss_derivative(&output, expected, loss_type);
             let mut delta = Matrix::from_data(vec![error]);
 
             // Backward pass.
             for i in (0..network.layers.len()).rev() {
+                // Input to layer i: post-activation of layer i-1, or raw input.
                 let input_for_layer = if i == 0 {
                     Matrix::from_data(vec![input.clone()])
                 } else {
-                    network.layers[i - 1].neurons.clone()
+                    // Use the cached post-activation of the previous layer.
+                    Matrix::from_data(vec![cache[i - 1].post_activation.clone()])
                 };
 
                 let (w_grad, b_grad) = network.layers[i].compute_gradients(
                     delta.clone(),
                     &input_for_layer,
+                    &cache[i].pre_activation,
                 );
 
                 if i > 0 {
                     delta = b_grad.clone() * network.layers[i].weights.transpose();
                 }
 
-                acc_grads[i].0 = acc_grads[i].0.clone() + w_grad;
-                acc_grads[i].1 = acc_grads[i].1.clone() + b_grad;
+                acc_grads[i].0 += w_grad;
+                acc_grads[i].1 += b_grad;
             }
         }
 
@@ -211,28 +225,28 @@ fn run_one_epoch(
 /// Scalar loss for one sample — dispatches on `LossType`.
 fn compute_loss(predicted: &[f64], expected: &[f64], loss_type: LossType) -> f64 {
     match loss_type {
-        LossType::Mse                => MseLoss::loss(predicted, expected),
-        LossType::CrossEntropy       => CrossEntropyLoss::loss(predicted, expected),
+        LossType::Mse => MseLoss::loss(predicted, expected),
+        LossType::CrossEntropy => CrossEntropyLoss::loss(predicted, expected),
         LossType::BinaryCrossEntropy => BceLoss::loss(predicted, expected),
-        LossType::Mae                => MaeLoss::loss(predicted, expected),
-        LossType::Huber              => HuberLoss::loss(predicted, expected),
+        LossType::Mae => MaeLoss::loss(predicted, expected),
+        LossType::Huber => HuberLoss::loss(predicted, expected),
     }
 }
 
 /// Per-output gradient for one sample — dispatches on `LossType`.
 fn compute_loss_derivative(predicted: &[f64], expected: &[f64], loss_type: LossType) -> Vec<f64> {
     match loss_type {
-        LossType::Mse                => MseLoss::derivative(predicted, expected),
-        LossType::CrossEntropy       => CrossEntropyLoss::derivative(predicted, expected),
+        LossType::Mse => MseLoss::derivative(predicted, expected),
+        LossType::CrossEntropy => CrossEntropyLoss::derivative(predicted, expected),
         LossType::BinaryCrossEntropy => BceLoss::derivative(predicted, expected),
-        LossType::Mae                => MaeLoss::derivative(predicted, expected),
-        LossType::Huber              => HuberLoss::derivative(predicted, expected),
+        LossType::Mae => MaeLoss::derivative(predicted, expected),
+        LossType::Huber => HuberLoss::derivative(predicted, expected),
     }
 }
 
 /// Mean loss over a full dataset without gradient accumulation (eval mode).
 fn compute_eval_loss(
-    network: &mut Network,
+    network: &Network,
     inputs: &[Vec<f64>],
     labels: &[Vec<f64>],
     loss_type: LossType,
@@ -241,9 +255,11 @@ fn compute_eval_loss(
     if n == 0 {
         return 0.0;
     }
-    let total: f64 = inputs.iter().zip(labels.iter())
+    let total: f64 = inputs
+        .iter()
+        .zip(labels.iter())
         .map(|(input, label)| {
-            let output = network.forward(input.clone());
+            let output = network.forward(input);
             compute_loss(&output, label, loss_type)
         })
         .sum();
@@ -253,7 +269,7 @@ fn compute_eval_loss(
 /// Fraction of samples classified correctly (argmax match).
 /// Used for `CrossEntropy` runs only.
 fn compute_accuracy_multiclass(
-    network: &mut Network,
+    network: &Network,
     inputs: &[Vec<f64>],
     labels: &[Vec<f64>],
 ) -> f64 {
@@ -261,9 +277,11 @@ fn compute_accuracy_multiclass(
     if n == 0 {
         return 0.0;
     }
-    let correct: usize = inputs.iter().zip(labels.iter())
+    let correct: usize = inputs
+        .iter()
+        .zip(labels.iter())
         .filter(|(input, label)| {
-            let output = network.forward((*input).clone());
+            let output = network.forward(input);
             argmax(&output) == argmax(label)
         })
         .count();
@@ -273,7 +291,7 @@ fn compute_accuracy_multiclass(
 /// Fraction of output nodes predicted correctly using a 0.5 threshold.
 /// Used for `BinaryCrossEntropy` runs only.
 fn compute_accuracy_binary(
-    network: &mut Network,
+    network: &Network,
     inputs: &[Vec<f64>],
     labels: &[Vec<f64>],
 ) -> f64 {
@@ -282,9 +300,9 @@ fn compute_accuracy_binary(
         return 0.0;
     }
     let mut total_correct = 0usize;
-    let mut total_nodes   = 0usize;
+    let mut total_nodes = 0usize;
     for (input, label) in inputs.iter().zip(labels.iter()) {
-        let output = network.forward(input.clone());
+        let output = network.forward(input);
         for (p, y) in output.iter().zip(label.iter()) {
             if (*p >= 0.5) == (*y >= 0.5) {
                 total_correct += 1;
@@ -292,7 +310,11 @@ fn compute_accuracy_binary(
             total_nodes += 1;
         }
     }
-    if total_nodes == 0 { 0.0 } else { total_correct as f64 / total_nodes as f64 }
+    if total_nodes == 0 {
+        0.0
+    } else {
+        total_correct as f64 / total_nodes as f64
+    }
 }
 
 /// Index of the maximum element in a slice.

@@ -30,6 +30,6 @@ fn main() {
     }
 
     for input in &inputs {
-        println!("Input: {:?} -> Output: {:.4}", input, network.forward(input.clone())[0]);
+        println!("Input: {:?} -> Output: {:.4}", input, network.forward(input)[0]);
     }
 }

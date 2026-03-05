@@ -1,26 +1,54 @@
-use crate::{math::matrix::Matrix, activation::activation::ActivationFunction};
-use serde::{Serialize, Deserialize};
+use crate::{activation::activation::ActivationFunction, math::matrix::Matrix};
+use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// ForwardCache — returned by feed_from / forward_with_cache
+// ---------------------------------------------------------------------------
+
+/// Per-layer cache produced by a single forward pass through one layer.
+///
+/// Stores both the pre-activation values (`z = W·x + b`) and the
+/// post-activation values (`a = σ(z)`) so the backward pass can compute
+/// `σ'(z)` and propagate deltas without touching mutable layer state.
+#[derive(Debug, Clone)]
+pub struct LayerCache {
+    /// Pre-activation values `z = W·x + b`.  Shape: `[size]`.
+    pub pre_activation: Vec<f64>,
+    /// Post-activation values `a = σ(z)`.  Shape: `[size]`.
+    pub post_activation: Vec<f64>,
+}
+
+/// One `LayerCache` entry per layer, ordered from input → output.
+pub type ForwardCache = Vec<LayerCache>;
+
+// ---------------------------------------------------------------------------
+// Layer
+// ---------------------------------------------------------------------------
+
+/// A single fully-connected layer.
+///
+/// # Weight layout
+/// `weights` has shape `(input_size, size)` stored row-major.
+/// Element `weights[k, j]` = connection from input neuron `k` to output neuron `j`.
+///
+/// `biases` has shape `(1, size)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Layer{
+pub struct Layer {
     pub size: usize,
-    #[serde(skip)]
-    pub neurons: Matrix,
-    #[serde(skip)]
-    pre_neurons: Matrix,  // pre-activation values (z = Wx + b) needed for correct derivative
     pub weights: Matrix,
     pub biases: Matrix,
-    pub activator: ActivationFunction
+    pub activator: ActivationFunction,
 }
 
 impl Layer {
+    /// Creates a new layer with the given size and activation function.
+    ///
+    /// Weight initialization:
+    /// - `ReLU`  → He init   (variance = 2 / fan_in)
+    /// - others  → Xavier init (variance = 1 / fan_in)
+    ///
+    /// Biases are initialized to zero.
     pub fn new(size: usize, input_size: usize, activation: ActivationFunction) -> Layer {
-        let neurons = Matrix::zeros(1, size);
-        let pre_neurons = Matrix::zeros(1, size);
-        // Choose weight initialization scheme based on the downstream activation:
-        //   ReLU  → He init   (variance = 2 / fan_in)
-        //   other → Xavier init (variance = 1 / fan_in)
-        // Biases are always initialized to zero — a standard safe default.
         let weights = match activation {
             ActivationFunction::ReLU => Matrix::he(input_size, size),
             _ => Matrix::xavier(input_size, size),
@@ -29,47 +57,89 @@ impl Layer {
 
         Layer {
             size,
-            neurons,
-            pre_neurons,
             weights,
             biases,
-            activator: activation
+            activator: activation,
         }
     }
 
-    pub fn feed_from(&mut self, input: Vec<f64>) -> Vec<f64> {
-        // z = W·x + b  (shape 1×size)
-        let z = Matrix::from_data(vec![input]) * self.weights.clone() + self.biases.clone();
+    /// Forward pass through this layer.
+    ///
+    /// Takes `input` as a slice of length `input_size` (= `self.weights.rows`).
+    /// Returns `(output, cache)` where `output` is the post-activation vector of
+    /// length `self.size` and `cache` holds `pre_activation` (z) and
+    /// `post_activation` (a) for use during backpropagation.
+    ///
+    /// This method takes `&self` (not `&mut self`), making `Network` `Sync` and
+    /// enabling safe parallel inference via `Arc<Network>`.
+    pub fn feed_from(&self, input: &[f64]) -> (Vec<f64>, LayerCache) {
+        let size = self.size;
 
-        // Apply activation — Softmax requires the full vector; all others are element-wise.
-        let a = match &self.activator {
+        // ── z = W·x + b ─────────────────────────────────────────────────────
+        // Inline zero-allocation matmul: weights is (input_size, size) row-major.
+        // output[j] = Σ_k  input[k] * weights[k, j]  + biases[j]
+        // Loop order: k then j — keeps weights row k contiguous in cache.
+        let mut z = vec![0.0_f64; size];
+        for k in 0..input.len() {
+            let w_row = &self.weights.data[k * size..(k + 1) * size];
+            let x_k = input[k];
+            for j in 0..size {
+                z[j] += x_k * w_row[j];
+            }
+        }
+        for j in 0..size {
+            z[j] += self.biases.data[j];
+        }
+
+        // ── a = σ(z) ────────────────────────────────────────────────────────
+        let a: Vec<f64> = match &self.activator {
             ActivationFunction::Softmax => {
                 // Numerically stable softmax: subtract max(z) before exp to
                 // prevent overflow while preserving the output distribution.
-                let logits = &z.data[0];
-                let max_z = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let exps: Vec<f64> = logits.iter().map(|&v| (v - max_z).exp()).collect();
+                let max_z = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = z.iter().map(|&v| (v - max_z).exp()).collect();
                 let sum_exps: f64 = exps.iter().sum();
-                let softmax: Vec<f64> = exps.iter().map(|&e| e / sum_exps).collect();
-                Matrix::from_data(vec![softmax])
+                exps.iter().map(|&e| e / sum_exps).collect()
             }
-            _ => z.map(|x| self.activator.function(x)),
+            _ => z.iter().map(|&v| self.activator.function(v)).collect(),
         };
 
-        self.pre_neurons = z;
-        self.neurons = a.clone();
-        a.data[0].clone()
+        let cache = LayerCache {
+            pre_activation: z,
+            post_activation: a.clone(),
+        };
+
+        (a, cache)
     }
 
-    /// Computes gradient adjustments. Returns (weights_grad, biases_grad).
-    /// `next_layer_delta` is ∂L/∂a for this layer (error in activation space).
+    /// Computes weight and bias gradients for this layer given the upstream delta
+    /// and the explicit pre-activation cache.
+    ///
+    /// # Arguments
+    /// - `next_layer_delta` — ∂L/∂a for this layer (error in activation space),
+    ///   shape `(1, size)`.
+    /// - `inputs`           — post-activation output of the **previous** layer (or
+    ///   the raw network input for layer 0), shape `(1, input_size)`.
+    /// - `pre_activation`   — `z` values cached during `feed_from`, length `size`.
+    ///
+    /// # Returns
+    /// `(weights_grad, biases_grad)` — raw (unscaled) gradient matrices.
     pub fn compute_gradients(
         &self,
         next_layer_delta: Matrix,
         inputs: &Matrix,
+        pre_activation: &[f64],
     ) -> (Matrix, Matrix) {
-        // Use pre-activation z so that derivative(z) = σ'(z) is computed correctly
-        let act_derivative = self.pre_neurons.map(|x| self.activator.derivative(x));
+        // σ'(z) applied element-wise
+        let act_derivative = Matrix {
+            rows: 1,
+            cols: self.size,
+            data: pre_activation
+                .iter()
+                .map(|&z| self.activator.derivative(z))
+                .collect(),
+        };
+
         // Element-wise (Hadamard) product: δ = error ⊙ σ'(z)
         let layer_delta = hadamard(&next_layer_delta, &act_derivative);
 
@@ -79,21 +149,27 @@ impl Layer {
         (weights_adjustment, biases_adjustment)
     }
 
-    /// Applies pre-computed gradients scaled by lr.
+    /// Applies pre-computed gradients in-place using SGD: `w -= lr * grad`.
+    ///
+    /// Uses `SubAssign` to avoid an extra clone of `self.weights`/`self.biases`.
     pub fn apply_gradients(&mut self, weights_grad: Matrix, biases_grad: Matrix, lr: f64) {
-        self.weights = self.weights.clone() - weights_grad.map(|x| x * lr);
-        self.biases = self.biases.clone() - biases_grad.map(|x| x * lr);
+        self.weights -= weights_grad.map(|x| x * lr);
+        self.biases -= biases_grad.map(|x| x * lr);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hadamard (element-wise) product
+// ---------------------------------------------------------------------------
+
 /// Element-wise (Hadamard) product of two same-shape matrices.
-fn hadamard(a: &Matrix, b: &Matrix) -> Matrix {
-    assert_eq!(a.rows, b.rows);
-    assert_eq!(a.cols, b.cols);
-    let data = a.data.iter().zip(b.data.iter())
-        .map(|(row_a, row_b)| {
-            row_a.iter().zip(row_b.iter()).map(|(x, y)| x * y).collect()
-        })
-        .collect();
-    Matrix::from_data(data)
+pub(crate) fn hadamard(a: &Matrix, b: &Matrix) -> Matrix {
+    assert_eq!(a.rows, b.rows, "hadamard: row mismatch");
+    assert_eq!(a.cols, b.cols, "hadamard: col mismatch");
+    let data: Vec<f64> = a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).collect();
+    Matrix {
+        rows: a.rows,
+        cols: a.cols,
+        data,
+    }
 }

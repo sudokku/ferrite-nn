@@ -109,14 +109,14 @@ fn argmax(v: &[f64]) -> usize {
 /// Used to produce a cheap per-epoch training accuracy estimate on 1,000
 /// randomly-chosen samples rather than the full 60,000.
 fn accuracy_on_subset(
-    network: &mut Network,
+    network: &Network,
     images: &[Vec<f64>],
     labels: &[Vec<f64>],
     indices: &[usize],
 ) -> f64 {
     let mut correct = 0usize;
     for &idx in indices {
-        let output = network.forward(images[idx].clone());
+        let output = network.forward(&images[idx]);
         if argmax(&output) == argmax(&labels[idx]) {
             correct += 1;
         }
@@ -146,6 +146,7 @@ fn train_epoch(
     batch_size: usize,
     progress_every: usize,
 ) -> f64 {
+    // Note: network is still &mut here because apply_gradients mutates weights.
     let n = inputs.len();
     let mut total_loss = 0.0;
 
@@ -172,8 +173,8 @@ fn train_epoch(
             let input    = &inputs[idx];
             let expected = &expected_outputs[idx];
 
-            // Forward pass — stores activations in each layer for backprop.
-            let output = network.forward(input.clone());
+            // Forward pass — stateless; caches returned explicitly.
+            let (output, cache) = network.forward_with_cache(input);
 
             // Accumulate cross-entropy loss for reporting.
             total_loss += CrossEntropyLoss::loss(&output, expected);
@@ -191,12 +192,14 @@ fn train_epoch(
                 let input_for_layer = if i == 0 {
                     Matrix::from_data(vec![input.clone()])
                 } else {
-                    network.layers[i - 1].neurons.clone()
+                    // Use the cached post-activation of the previous layer.
+                    Matrix::from_data(vec![cache[i - 1].post_activation.clone()])
                 };
 
                 let (w_grad, b_grad) = network.layers[i].compute_gradients(
                     delta.clone(),
                     &input_for_layer,
+                    &cache[i].pre_activation,
                 );
 
                 if i > 0 {
@@ -207,8 +210,8 @@ fn train_epoch(
                     delta = b_grad.clone() * network.layers[i].weights.transpose();
                 }
 
-                acc_grads[i].0 = acc_grads[i].0.clone() + w_grad;
-                acc_grads[i].1 = acc_grads[i].1.clone() + b_grad;
+                acc_grads[i].0 += w_grad;
+                acc_grads[i].1 += b_grad;
             }
         }
 
@@ -309,7 +312,7 @@ fn main() {
     );
 
     // Pre-training baseline — expected ~10% for a random 10-class classifier.
-    let baseline_acc = accuracy_on_subset(&mut network, &train_images, &train_labels, &acc_indices);
+    let baseline_acc = accuracy_on_subset(&network, &train_images, &train_labels, &acc_indices);
     println!("Pre-training accuracy (random weights): {:.2}%", baseline_acc);
     println!("  (Expected ~10% for a 10-class random classifier)\n");
 
@@ -367,7 +370,7 @@ fn main() {
     let mut sample_predictions: Vec<(usize, usize)> = Vec::new();
 
     for (i, (image, label)) in test_images.iter().zip(test_labels.iter()).enumerate() {
-        let output    = network.forward(image.clone());
+        let output    = network.forward(image);
         let predicted = argmax(&output);
         let truth     = argmax(label);
 

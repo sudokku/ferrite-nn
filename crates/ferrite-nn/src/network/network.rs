@@ -1,7 +1,8 @@
-use crate::{activation::activation::ActivationFunction, layers::dense::Layer};
+use crate::activation::activation::ActivationFunction;
+use crate::layers::dense::{ForwardCache, Layer};
 use crate::network::metadata::ModelMetadata;
 use crate::network::spec::NetworkSpec;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Network {
@@ -11,21 +12,47 @@ pub struct Network {
 }
 
 impl Network {
-    /// Builds a network from (size, input_size, activation) tuples.
+    /// Builds a network from `(size, input_size, activation)` tuples.
     pub fn new(layer_specs: Vec<(usize, usize, ActivationFunction)>) -> Network {
-        let layers = layer_specs.into_iter()
+        let layers = layer_specs
+            .into_iter()
             .map(|(size, input_size, activation)| Layer::new(size, input_size, activation))
             .collect();
-        Network { layers, metadata: None }
+        Network {
+            layers,
+            metadata: None,
+        }
     }
 
-    /// Forward pass; stores activations in each layer for backprop.
-    pub fn forward(&mut self, input: Vec<f64>) -> Vec<f64> {
-        let mut current = input;
-        for layer in &mut self.layers {
-            current = layer.feed_from(current);
+    /// Inference-only forward pass.
+    ///
+    /// Takes `&self` (not `&mut self`), so `Network` is `Sync` and an
+    /// `Arc<Network>` can be shared safely across threads without cloning.
+    /// Layer caches are discarded; use `forward_with_cache` during training.
+    pub fn forward(&self, input: &[f64]) -> Vec<f64> {
+        let mut current: Vec<f64> = input.to_vec();
+        for layer in &self.layers {
+            let (output, _cache) = layer.feed_from(&current);
+            current = output;
         }
         current
+    }
+
+    /// Training forward pass — returns the final output **and** per-layer caches.
+    ///
+    /// The returned `ForwardCache` contains one `LayerCache` per layer (in
+    /// forward order) with pre- and post-activation values needed by backprop.
+    pub fn forward_with_cache(&self, input: &[f64]) -> (Vec<f64>, ForwardCache) {
+        let mut current: Vec<f64> = input.to_vec();
+        let mut cache: ForwardCache = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let (output, layer_cache) = layer.feed_from(&current);
+            cache.push(layer_cache);
+            current = output;
+        }
+
+        (current, cache)
     }
 
     /// Serializes the network weights to a pretty-printed JSON file.
@@ -45,9 +72,9 @@ impl Network {
     }
 
     /// Returns the number of input neurons the network expects.
-    /// This is the column count of the first layer's weight matrix.
+    /// This is the row count of the first layer's weight matrix (= fan-in).
     pub fn input_size(&self) -> usize {
-        self.layers.first().map(|l| l.weights.cols).unwrap_or(0)
+        self.layers.first().map(|l| l.weights.rows).unwrap_or(0)
     }
 
     /// Returns a reference to the output layer's activation function.
@@ -63,7 +90,9 @@ impl Network {
     ///
     /// Metadata is copied from the spec if present.
     pub fn from_spec(spec: &NetworkSpec) -> Network {
-        let layers = spec.layers.iter()
+        let layers = spec
+            .layers
+            .iter()
             .map(|ls| Layer::new(ls.size, ls.input_size, ls.activation.clone()))
             .collect();
         Network {

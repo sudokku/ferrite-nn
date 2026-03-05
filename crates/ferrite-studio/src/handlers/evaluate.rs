@@ -48,11 +48,10 @@ pub async fn handle_get(State(state): State<SharedState>) -> Json<EvaluateRespon
         (&st.trained_network, &st.dataset)
     {
         if !ds.val_inputs.is_empty() {
-            let mut net = network_ref.clone();
-            let matrix  = build_confusion_matrix(&mut net, &ds.val_inputs, &ds.val_labels);
+            let matrix  = build_confusion_matrix(network_ref, &ds.val_inputs, &ds.val_labels);
             // Use numeric labels "0", "1", ... unless model has output_labels.
             let n_classes = ds.val_labels.first().map(|l| l.len()).unwrap_or(0);
-            let labels: Option<Vec<String>> = net.metadata
+            let labels: Option<Vec<String>> = network_ref.metadata
                 .as_ref()
                 .and_then(|m| m.output_labels.clone());
             let class_labels = labels.or_else(|| {
@@ -112,7 +111,7 @@ pub async fn handle_export(State(state): State<SharedState>) -> Response {
 // ---------------------------------------------------------------------------
 
 fn build_confusion_matrix(
-    network: &mut ferrite_nn::Network,
+    network: &ferrite_nn::Network,
     val_inputs: &[Vec<f64>],
     val_labels: &[Vec<f64>],
 ) -> Option<Vec<Vec<usize>>> {
@@ -124,7 +123,7 @@ fn build_confusion_matrix(
     let mut matrix = vec![vec![0usize; n_classes]; n_classes];
 
     for (input, label) in val_inputs.iter().zip(val_labels.iter()) {
-        let output    = network.forward(input.clone());
+        let output    = network.forward(input);
         let predicted = argmax(&output);
         let truth     = argmax(label);
         if predicted < n_classes && truth < n_classes {

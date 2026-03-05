@@ -262,7 +262,7 @@ fn load_model_info(name: &str) -> Option<ModelInfo> {
 
 fn run_infer_numeric(model_name: &str, raw_inputs: &str) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = Network::load_json(&path)
+    let network = Network::load_json(&path)
         .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
 
     if network.layers.is_empty() {
@@ -284,7 +284,7 @@ fn run_infer_numeric(model_name: &str, raw_inputs: &str) -> Result<InferResult, 
         ));
     }
 
-    let output = network.forward(inputs);
+    let output = network.forward(&inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
     let activation = network.output_activation()
         .cloned()
@@ -299,7 +299,7 @@ fn run_infer_grayscale(
     height: u32,
 ) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = Network::load_json(&path)
+    let network = Network::load_json(&path)
         .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
 
     if network.layers.is_empty() {
@@ -309,7 +309,7 @@ fn run_infer_grayscale(
     let inputs = image_bytes_to_grayscale_input(image_bytes, width, height)
         .map_err(|e| format!("Image decode error: {}", e))?;
 
-    let output = network.forward(inputs);
+    let output = network.forward(&inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
     let activation = network.output_activation()
         .cloned()
@@ -324,7 +324,7 @@ fn run_infer_rgb(
     height: u32,
 ) -> Result<InferResult, String> {
     let path = format!("trained_models/{}.json", model_name);
-    let mut network = Network::load_json(&path)
+    let network = Network::load_json(&path)
         .map_err(|e| format!("Could not load model '{}': {}", model_name, e))?;
 
     if network.layers.is_empty() {
@@ -334,7 +334,7 @@ fn run_infer_rgb(
     let inputs = image_bytes_to_rgb_input(image_bytes, width, height)
         .map_err(|e| format!("Image decode error: {}", e))?;
 
-    let output = network.forward(inputs);
+    let output = network.forward(&inputs);
     let labels = network.metadata.as_ref().and_then(|m| m.output_labels.as_deref());
     let activation = network.output_activation()
         .cloned()

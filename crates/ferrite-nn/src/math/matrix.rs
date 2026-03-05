@@ -1,36 +1,44 @@
 use rand::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::f64::consts::PI;
-use std::ops::{Add, Sub, Mul};
+use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Matrix{
+/// A 2-D matrix stored in row-major flat `Vec<f64>`.
+///
+/// Element `(i, j)` (0-indexed) lives at `data[i * cols + j]`.
+///
+/// # Serialization
+/// Serialized and deserialized as `Vec<Vec<f64>>` (nested row arrays) so that
+/// JSON model files written by previous versions of Ferrite remain loadable.
+#[derive(Debug, Clone)]
+pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    pub data: Vec<Vec<f64>>
+    /// Flat row-major storage.  Length is always `rows * cols`.
+    pub data: Vec<f64>,
 }
 
-impl Matrix{
+// ---------------------------------------------------------------------------
+// Constructors
+// ---------------------------------------------------------------------------
+
+impl Matrix {
+    /// Creates a zero-filled matrix of shape `(rows, cols)`.
     pub fn zeros(rows: usize, cols: usize) -> Matrix {
-        Matrix{
+        Matrix {
             rows,
             cols,
-            data: vec![vec![0.0; cols]; rows]
+            data: vec![0.0; rows * cols],
         }
     }
 
+    /// Fills a `(rows, cols)` matrix with uniform random values in `[-1, 1]`.
     pub fn random(rows: usize, cols: usize) -> Matrix {
         let mut rng = rand::thread_rng();
-        let mut res = Matrix::zeros(rows, cols);
-
-        for i in 0..rows {
-            for j in 0..cols {
-                res.data[i][j] = rng.gen::<f64>() * 2.0 - 1.0;
-            }
-
-        }
-
-        res
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|_| rng.gen::<f64>() * 2.0 - 1.0)
+            .collect();
+        Matrix { rows, cols, data }
     }
 
     /// Samples a single value from N(0, 1) using the Box-Muller transform.
@@ -51,13 +59,10 @@ impl Matrix{
     pub fn he(rows: usize, cols: usize) -> Matrix {
         let mut rng = rand::thread_rng();
         let std_dev = (2.0 / cols as f64).sqrt();
-        let mut res = Matrix::zeros(rows, cols);
-        for i in 0..rows {
-            for j in 0..cols {
-                res.data[i][j] = Matrix::sample_standard_normal(&mut rng) * std_dev;
-            }
-        }
-        res
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|_| Matrix::sample_standard_normal(&mut rng) * std_dev)
+            .collect();
+        Matrix { rows, cols, data }
     }
 
     /// Xavier (Glorot) initialization: samples from N(0, sqrt(1 / cols)).
@@ -69,72 +74,127 @@ impl Matrix{
     pub fn xavier(rows: usize, cols: usize) -> Matrix {
         let mut rng = rand::thread_rng();
         let std_dev = (1.0 / cols as f64).sqrt();
-        let mut res = Matrix::zeros(rows, cols);
-        for i in 0..rows {
-            for j in 0..cols {
-                res.data[i][j] = Matrix::sample_standard_normal(&mut rng) * std_dev;
-            }
-        }
-        res
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|_| Matrix::sample_standard_normal(&mut rng) * std_dev)
+            .collect();
+        Matrix { rows, cols, data }
     }
 
+    /// Transposes the matrix, returning a new `(cols, rows)` matrix.
     pub fn transpose(&self) -> Matrix {
-        let mut res = Matrix::zeros(self.cols, self.rows);
-
-        for i in 0..res.rows {
-            for j in 0..res.cols {
-                res.data[i][j] = self.data[j][i];
+        let mut result = Matrix::zeros(self.cols, self.rows);
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                // result[j, i] = self[i, j]
+                result.data[j * self.rows + i] = self.data[i * self.cols + j];
             }
         }
-
-        res
+        result
     }
 
-    pub fn map<F>(&self, functor: F) -> Matrix
+    /// Applies `f` element-wise, returning a new matrix of the same shape.
+    pub fn map<F>(&self, f: F) -> Matrix
     where
         F: Fn(f64) -> f64,
     {
-        Matrix::from_data(
-            (self.data)
-                .clone()
-                .into_iter()
-                .map(|row| row.into_iter().map(|x| functor(x)).collect())
-                .collect()
-        )
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: self.data.iter().map(|&x| f(x)).collect(),
+        }
     }
 
-    pub fn from_data(data: Vec<Vec<f64>>) -> Matrix {
+    /// Constructs a `Matrix` from a nested `Vec<Vec<f64>>`.
+    ///
+    /// The outer Vec is rows; each inner Vec must have the same length (cols).
+    /// Panics if `data` is empty or rows have inconsistent lengths.
+    pub fn from_data(nested: Vec<Vec<f64>>) -> Matrix {
+        let rows = nested.len();
+        assert!(rows > 0, "Matrix::from_data: data must not be empty");
+        let cols = nested[0].len();
+        let data: Vec<f64> = nested.into_iter().flatten().collect();
+        assert_eq!(
+            data.len(),
+            rows * cols,
+            "Matrix::from_data: all rows must have the same length"
+        );
+        Matrix { rows, cols, data }
+    }
+
+    /// Inline (non-allocating) matrix multiply: `lhs * rhs` returning a new matrix.
+    ///
+    /// Uses the `i, k, j` loop order to keep `lhs[i, k]` in a register while
+    /// streaming through the contiguous `rhs` row `k`, improving cache behaviour
+    /// compared to the naive `i, j, k` order.
+    ///
+    /// Panics if `lhs.cols != rhs.rows`.
+    pub fn matmul(lhs: &Matrix, rhs: &Matrix) -> Matrix {
+        assert_eq!(
+            lhs.cols, rhs.rows,
+            "Matrix::matmul: lhs.cols ({}) != rhs.rows ({})",
+            lhs.cols, rhs.rows
+        );
+        let mut result = Matrix::zeros(lhs.rows, rhs.cols);
+        for i in 0..lhs.rows {
+            for k in 0..lhs.cols {
+                let a_ik = lhs.data[i * lhs.cols + k];
+                let rhs_row_start = k * rhs.cols;
+                let res_row_start = i * rhs.cols;
+                for j in 0..rhs.cols {
+                    result.data[res_row_start + j] += a_ik * rhs.data[rhs_row_start + j];
+                }
+            }
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default
+// ---------------------------------------------------------------------------
+
+impl Default for Matrix {
+    fn default() -> Self {
         Matrix {
-            rows: data.len(),
-            cols: data[0].len(),
-            data
+            rows: 0,
+            cols: 0,
+            data: vec![],
         }
     }
 }
 
-impl Default for Matrix {
-    fn default() -> Self {
-        Matrix { rows: 0, cols: 0, data: vec![] }
-    }
-}
+// ---------------------------------------------------------------------------
+// Arithmetic operators
+// ---------------------------------------------------------------------------
 
 impl Add for Matrix {
     type Output = Matrix;
 
     fn add(self, rhs: Self) -> Self::Output {
-        if self.rows != rhs.rows || self.cols != rhs.cols {
-            panic!("Matrices are of incorrect sizes")
+        assert_eq!(self.rows, rhs.rows, "Matrix::add: row mismatch");
+        assert_eq!(self.cols, rhs.cols, "Matrix::add: col mismatch");
+        let data: Vec<f64> = self
+            .data
+            .iter()
+            .zip(rhs.data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data,
         }
+    }
+}
 
-        let mut res = Matrix::zeros(self.rows, self.cols);
-
-        for i in 0..self.rows {
-            for j in 0..self.cols {
-                res.data[i][j] = self.data[i][j] + rhs.data[i][j];
-            }
+impl AddAssign for Matrix {
+    /// In-place element-wise addition.  Avoids the clone inherent in `a = a + b`.
+    fn add_assign(&mut self, rhs: Self) {
+        assert_eq!(self.rows, rhs.rows, "Matrix::add_assign: row mismatch");
+        assert_eq!(self.cols, rhs.cols, "Matrix::add_assign: col mismatch");
+        for (a, b) in self.data.iter_mut().zip(rhs.data.iter()) {
+            *a += b;
         }
-
-        res
     }
 }
 
@@ -142,44 +202,80 @@ impl Sub for Matrix {
     type Output = Matrix;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        if self.rows != rhs.rows || self.cols != rhs.cols {
-            panic!("Matrices are of incorrect sizes")
+        assert_eq!(self.rows, rhs.rows, "Matrix::sub: row mismatch");
+        assert_eq!(self.cols, rhs.cols, "Matrix::sub: col mismatch");
+        let data: Vec<f64> = self
+            .data
+            .iter()
+            .zip(rhs.data.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data,
         }
+    }
+}
 
-        let mut res = Matrix::zeros(self.rows, self.cols);
-
-        for i in 0..self.rows {
-            for j in 0..self.cols {
-                res.data[i][j] = self.data[i][j] - rhs.data[i][j];
-            }
+impl SubAssign for Matrix {
+    /// In-place element-wise subtraction.  Avoids the clone in `a = a - b`.
+    fn sub_assign(&mut self, rhs: Self) {
+        assert_eq!(self.rows, rhs.rows, "Matrix::sub_assign: row mismatch");
+        assert_eq!(self.cols, rhs.cols, "Matrix::sub_assign: col mismatch");
+        for (a, b) in self.data.iter_mut().zip(rhs.data.iter()) {
+            *a -= b;
         }
-
-        res
     }
 }
 
 impl Mul for Matrix {
     type Output = Matrix;
 
+    /// Matrix multiplication via the `i, k, j` cache-friendly loop order.
     fn mul(self, rhs: Self) -> Self::Output {
-        if self.cols != rhs.rows {
-            panic!("Matrices are of incorrect sizes")
+        Matrix::matmul(&self, &rhs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serde — serialize/deserialize as nested Vec<Vec<f64>> for JSON compatibility
+// ---------------------------------------------------------------------------
+
+impl Serialize for Matrix {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Reconstruct row-slices on the fly; no extra allocation per row needed
+        // since serde will consume the iterator immediately.
+        let nested: Vec<&[f64]> = (0..self.rows)
+            .map(|i| &self.data[i * self.cols..(i + 1) * self.cols])
+            .collect();
+        // We also need to persist rows/cols so that a zero-element matrix round-trips.
+        // Encode as { "rows": N, "cols": M, "data": [[...], ...] }
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Matrix", 3)?;
+        s.serialize_field("rows", &self.rows)?;
+        s.serialize_field("cols", &self.cols)?;
+        s.serialize_field("data", &nested)?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Matrix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Accept both legacy format (object with rows/cols/data) and the same
+        // format we now emit.  The "data" field is always Vec<Vec<f64>>.
+        #[derive(Deserialize)]
+        struct MatrixHelper {
+            rows: usize,
+            cols: usize,
+            data: Vec<Vec<f64>>,
         }
-
-        let mut res =  Matrix::zeros(self.rows, rhs.cols);
-
-        for i in 0..res.rows {
-            for j in 0..res.cols {
-                let mut sum = 0.0;
-
-                for k in 0..self.cols {
-                    sum += self.data[i][k] * rhs.data[k][j];
-                }
-
-                res.data[i][j] = sum;
-            }
-        }
-
-        res
+        let h = MatrixHelper::deserialize(deserializer)?;
+        let flat: Vec<f64> = h.data.into_iter().flatten().collect();
+        Ok(Matrix {
+            rows: h.rows,
+            cols: h.cols,
+            data: flat,
+        })
     }
 }
